@@ -38,6 +38,10 @@ import {
   zodSchemaToJsonString,
   buildJsonSchemaInstruction,
 } from '../../utils/zod-schema.js';
+import {
+  getCapability,
+  type CapabilityRuntimeContext,
+} from '../../capabilities/index.js';
 
 // Define tool hook context - provides access to messages and tool call details
 export type ToolHookContext = {
@@ -251,6 +255,26 @@ const ExpectedOutputSchema = z.union([
 /** Type for conversation history messages - enables KV cache optimization */
 export type ConversationMessage = z.infer<typeof ConversationMessageSchema>;
 
+// Schema for a single capability configuration on the AI agent
+const CapabilityConfigSchema = z.object({
+  id: z
+    .string()
+    .min(1)
+    .describe('Capability ID (e.g., "google-doc-knowledge-base")'),
+  inputs: z
+    .record(
+      z.string(),
+      z.union([z.string(), z.number(), z.boolean(), z.array(z.string())])
+    )
+    .default({})
+    .describe('Input parameter values for this capability'),
+  credentials: z
+    .record(z.nativeEnum(CredentialType), z.string())
+    .default({})
+    .optional()
+    .describe('Capability-specific credentials (injected at runtime)'),
+});
+
 // Define the parameters schema for the AI Agent bubble
 const AIAgentParamsSchema = z.object({
   message: z
@@ -321,6 +345,13 @@ const AIAgentParamsSchema = z.object({
     .default(false)
     .describe(
       'Enable real-time streaming of tokens, tool calls, and iteration progress'
+    ),
+  capabilities: z
+    .array(CapabilityConfigSchema)
+    .default([])
+    .optional()
+    .describe(
+      'Capabilities that extend the agent with bundled tools, prompts, and credentials. Example: [{ id: "google-doc-knowledge-base", inputs: { docId: "your-doc-id" } }]'
     ),
   expectedOutputSchema: ExpectedOutputSchema.optional().describe(
     'Zod schema or JSON schema string that defines the expected structure of the AI response. When provided, automatically enables JSON mode and instructs the AI to output in the exact format. Example: z.object({ summary: z.string(), items: z.array(z.object({ name: z.string(), score: z.number() })) })'
@@ -503,7 +534,7 @@ export class AIAgentBubble extends ServiceBubble<
   /**
    * Modify params before execution - centralizes all param transformations
    */
-  private beforeAction(): void {
+  private async beforeAction(): Promise<void> {
     // Enforce minimum maxTokens of 10000
     if (
       this.params.model.maxTokens === undefined ||
@@ -522,6 +553,117 @@ export class AIAgentBubble extends ServiceBubble<
       );
       this.params.systemPrompt = `${this.params.systemPrompt}\n\n${buildJsonSchemaInstruction(schemaString)}`;
     }
+
+    // Inject current UTC time into system prompt
+    const now = new Date().toLocaleString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'UTC',
+      timeZoneName: 'short',
+    });
+    this.params.systemPrompt = `${this.params.systemPrompt}\n\nCurrent time: ${now}`;
+
+    // Apply capability model config overrides
+    const caps = this.params.capabilities ?? [];
+    if (caps.length > 1) {
+      // Multi-capability delegator: use Gemini 3 Pro for reliable tool-calling / routing.
+      // Sub-agents apply their own modelConfigOverride in single-cap mode.
+      this.params.model.model =
+        RECOMMENDED_MODELS.BEST as typeof this.params.model.model;
+      this.params.model.reasoningEffort = undefined;
+    } else {
+      // Single-cap: apply that capability's model override directly
+      for (const capConfig of caps) {
+        const capDef = getCapability(capConfig.id);
+        const override = capDef?.metadata.modelConfigOverride;
+        if (!override) continue;
+        if (override.model)
+          this.params.model.model =
+            override.model as typeof this.params.model.model;
+        if (override.reasoningEffort)
+          this.params.model.reasoningEffort = override.reasoningEffort;
+        if (override.maxTokens)
+          this.params.model.maxTokens = Math.max(
+            this.params.model.maxTokens ?? 0,
+            override.maxTokens
+          );
+      }
+    }
+
+    // Inject capability system prompts
+    if (caps.length > 1) {
+      // Multi-capability: summaries with tool names + delegation hints — sub-agents get full prompts
+      const summaries = caps
+        .map((c) => {
+          const def = getCapability(c.id);
+          if (!def) return null;
+          const toolNames = def.metadata.tools.map((t) => t.name).join(', ');
+          let summary = `- "${def.metadata.name}" (id: ${c.id}): ${def.metadata.description}`;
+          if (toolNames) summary += `\n  Tools: ${toolNames}`;
+          if (def.metadata.delegationHint)
+            summary += `\n  When to use: ${def.metadata.delegationHint}`;
+          return summary;
+        })
+        .filter(Boolean);
+
+      this.params.systemPrompt += `\n\nYou have the following capabilities. You MUST use the 'use-capability' tool to delegate tasks to them — NEVER handle a capability-related request yourself.\n${summaries.join('\n')}\n\nRULES:\n- ALWAYS call use-capability when the user's request could be handled by a capability. Do NOT respond directly.\n- Include all relevant context from the conversation in the task description.\n- You can call multiple capabilities in sequence if needed.\n- When in doubt, delegate — the capability will decide if it can help.\n- Only respond directly for greetings, clarifying questions, or requests that clearly don't match any capability.`;
+    } else {
+      // Single or zero capabilities: eager load as before
+      for (const capConfig of caps) {
+        const capDef = getCapability(capConfig.id);
+        if (!capDef) continue;
+
+        const ctx: CapabilityRuntimeContext = {
+          credentials: this.resolveCapabilityCredentials(capDef, capConfig),
+          inputs: capConfig.inputs ?? {},
+          bubbleContext: this.context,
+        };
+
+        const addition =
+          (await capDef.createSystemPrompt?.(ctx)) ??
+          capDef.metadata.systemPromptAddition;
+
+        if (addition) {
+          this.params.systemPrompt = `${this.params.systemPrompt}\n\n${addition}`;
+        }
+      }
+    }
+  }
+
+  /** Appends text from capability responseAppend factories to the final response. */
+  private async applyCapabilityResponseAppend(
+    result: AIAgentResult
+  ): Promise<AIAgentResult> {
+    const caps = this.params.capabilities ?? [];
+    // Multi-cap: sub-agents handle their own responseAppend
+    if (caps.length > 1) return result;
+
+    const appendParts: string[] = [];
+    for (const capConfig of caps) {
+      const capDef = getCapability(capConfig.id);
+      if (!capDef?.createResponseAppend) continue;
+
+      const ctx: CapabilityRuntimeContext = {
+        credentials: this.resolveCapabilityCredentials(capDef, capConfig),
+        inputs: capConfig.inputs ?? {},
+        bubbleContext: this.context,
+      };
+
+      const text = await capDef.createResponseAppend(ctx);
+      if (text) appendParts.push(text);
+    }
+
+    if (appendParts.length > 0) {
+      return {
+        ...result,
+        response: `${result.response}\n\n${appendParts.join('\n\n')}`,
+      };
+    }
+    return result;
   }
 
   protected async performAction(
@@ -531,18 +673,27 @@ export class AIAgentBubble extends ServiceBubble<
     void context;
 
     // Apply param transformations before execution
-    this.beforeAction();
+    await this.beforeAction();
 
     try {
+      let result: AIAgentResult;
+
       // Check if this is a deep research model - bypass LangChain and call OpenRouter directly
       if (this.isDeepResearchModel(this.params.model.model)) {
         console.log(
           '[AIAgent] Deep research model detected, using direct OpenRouter API'
         );
-        return await this.executeDeepResearchViaOpenRouter();
+        result = await this.executeDeepResearchViaOpenRouter();
+      } else {
+        result = await this.executeWithModel(this.params.model);
       }
 
-      return await this.executeWithModel(this.params.model);
+      // Append capability response additions (e.g. tips, blurbs)
+      if (result.success) {
+        result = await this.applyCapabilityResponseAppend(result);
+      }
+
+      return result;
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
@@ -1059,7 +1210,308 @@ export class AIAgentBubble extends ServiceBubble<
       }
     }
 
+    // 3. Capability tools
+    const caps = this.params.capabilities ?? [];
+    if (caps.length > 1) {
+      // Multi-capability: delegation mode — register a single use-capability tool
+      const capIds = caps.map((c) => c.id);
+      tools.push(
+        new DynamicStructuredTool({
+          name: 'use-capability',
+          description:
+            'Delegate a task to a specialized capability. The capability has its own tools and context to handle the task.',
+          schema: z.object({
+            capabilityId: z
+              .enum(capIds as [string, ...string[]])
+              .describe('Which capability to delegate to'),
+            task: z
+              .string()
+              .describe(
+                'Clear description of what to do. Include any relevant context from the conversation.'
+              ),
+          }),
+          func: async (input: Record<string, unknown>) => {
+            const capabilityId = input.capabilityId as string;
+            const task = input.task as string;
+            const capConfig = caps.find((c) => c.id === capabilityId);
+            const capDef = getCapability(capabilityId);
+            if (!capConfig || !capDef)
+              return { error: `Capability "${capabilityId}" not found` };
+
+            const subAgent = new AIAgentBubble(
+              {
+                message: task,
+                systemPrompt: '', // capability's systemPrompt fills this via beforeAction
+                model: { ...this.params.model },
+                capabilities: [capConfig], // single cap = eager load in sub-agent
+                credentials: this.params.credentials,
+              },
+              this.context
+            );
+
+            const result = await subAgent.action();
+            if (!result.success) {
+              return { success: false, error: result.error };
+            }
+            return { success: true, response: result.data?.response };
+          },
+        } as any)
+      );
+      console.log(
+        `🔧 [AIAgent] Multi-capability delegation mode: registered use-capability tool for [${capIds.join(', ')}]`
+      );
+    } else {
+      // Single capability or none: register tools directly as before
+      for (const capConfig of caps) {
+        const capDef = getCapability(capConfig.id);
+        if (!capDef) {
+          console.warn(
+            `[AIAgent] Capability '${capConfig.id}' not found in registry. Skipping.`
+          );
+          continue;
+        }
+
+        try {
+          // Shared ctx captured by all tool funcs via closure — we mutate bubbleContext per-tool
+          const ctx: CapabilityRuntimeContext = {
+            credentials: this.resolveCapabilityCredentials(capDef, capConfig),
+            inputs: capConfig.inputs ?? {},
+            bubbleContext: this.context,
+          };
+          const toolFuncs = capDef.createTools(ctx);
+          const logger = this.context?.logger;
+
+          for (const toolMeta of capDef.metadata.tools) {
+            const func = toolFuncs[toolMeta.name];
+            if (!func) continue;
+
+            // Resolve this capability tool's variableId and uniqueId from the dependency graph
+            const { variableId: capToolVariableId, uniqueId: capToolUniqueId } =
+              this.resolveCapabilityToolNode(toolMeta.name);
+
+            // Build a per-tool child context so inner bubbles resolve under this capability tool
+            const capToolContext: BubbleContext | undefined = this.context
+              ? {
+                  ...this.context,
+                  variableId: capToolVariableId,
+                  currentUniqueId: capToolUniqueId,
+                  __uniqueIdCounters__: {},
+                }
+              : undefined;
+
+            // Wrap the tool function with execution logging and per-tool context
+            const wrappedFunc = async (
+              input: Record<string, unknown>
+            ): Promise<unknown> => {
+              logger?.logBubbleExecution(
+                capToolVariableId,
+                toolMeta.name,
+                toolMeta.name,
+                input
+              );
+
+              try {
+                // Swap ctx.bubbleContext so inner bubbles resolve under the capability tool node
+                ctx.bubbleContext = capToolContext;
+                const result = await func(input);
+                ctx.bubbleContext = this.context; // restore
+
+                logger?.logBubbleExecutionComplete(
+                  capToolVariableId,
+                  toolMeta.name,
+                  toolMeta.name,
+                  result
+                );
+                return result;
+              } catch (error) {
+                ctx.bubbleContext = this.context; // restore on error
+                logger?.logBubbleExecutionComplete(
+                  capToolVariableId,
+                  toolMeta.name,
+                  toolMeta.name,
+                  { success: false, error: String(error) }
+                );
+                throw error;
+              }
+            };
+
+            // Convert JSON schema back to Zod for DynamicStructuredTool
+            const toolSchema = this.jsonSchemaToZod(toolMeta.parameterSchema);
+
+            const dynamicTool = new DynamicStructuredTool({
+              name: toolMeta.name,
+              description: toolMeta.description,
+              schema: toolSchema,
+              func: wrappedFunc as (
+                input: Record<string, unknown>
+              ) => Promise<unknown>,
+            } as any);
+
+            tools.push(dynamicTool);
+            console.log(
+              `🔧 [AIAgent] Registered capability tool: ${toolMeta.name} (from ${capConfig.id}, variableId: ${capToolVariableId})`
+            );
+          }
+        } catch (error) {
+          console.error(
+            `Error initializing capability '${capConfig.id}':`,
+            error
+          );
+          continue;
+        }
+      }
+    }
+
     return tools;
+  }
+
+  /**
+   * Resolves credentials for a capability by pulling from the bubble-level
+   * credentials (this.params.credentials) for each type the capability requires,
+   * then overlaying any explicitly set capConfig.credentials on top.
+   */
+  private resolveCapabilityCredentials(
+    capDef: {
+      metadata: {
+        requiredCredentials: CredentialType[];
+        optionalCredentials?: CredentialType[];
+      };
+    },
+    capConfig: { credentials?: Record<string, string> }
+  ): Partial<Record<CredentialType, string>> {
+    const resolved: Partial<Record<CredentialType, string>> = {};
+
+    // Pull from bubble-level credentials for each type the capability needs
+    const allCredTypes = [
+      ...capDef.metadata.requiredCredentials,
+      ...(capDef.metadata.optionalCredentials ?? []),
+    ];
+    for (const credType of allCredTypes) {
+      if (this.params.credentials && this.params.credentials[credType]) {
+        resolved[credType] = this.params.credentials[credType];
+      }
+    }
+
+    // Overlay any explicitly set capability-level credentials (take precedence)
+    if (capConfig.credentials) {
+      for (const [key, value] of Object.entries(capConfig.credentials)) {
+        resolved[key as CredentialType] = value;
+      }
+    }
+
+    return resolved;
+  }
+
+  /**
+   * Resolves the variableId and uniqueId for a capability tool by walking the dependency graph.
+   * Finds the child node matching the given tool name under the current ai-agent node.
+   * Falls back to -999/empty string if the dependency graph is unavailable or the tool is not found.
+   */
+  private resolveCapabilityToolNode(toolName: string): {
+    variableId: number;
+    uniqueId: string;
+  } {
+    const graph = this.context?.dependencyGraph;
+    const currentId = this.context?.currentUniqueId;
+    if (!graph) return { variableId: -999, uniqueId: '' };
+
+    // Find the current ai-agent node in the dependency graph
+    const findByUniqueId = (
+      node: {
+        uniqueId?: string;
+        dependencies?: Array<{
+          uniqueId?: string;
+          name: string;
+          variableId?: number;
+          dependencies?: unknown[];
+        }>;
+      },
+      target: string
+    ): {
+      dependencies?: Array<{
+        uniqueId?: string;
+        name: string;
+        variableId?: number;
+      }>;
+    } | null => {
+      if (node.uniqueId === target) return node;
+      for (const child of node.dependencies || []) {
+        const found = findByUniqueId(child as typeof node, target);
+        if (found) return found;
+      }
+      return null;
+    };
+
+    const parentNode = currentId ? findByUniqueId(graph, currentId) : graph;
+    if (!parentNode?.dependencies) return { variableId: -999, uniqueId: '' };
+
+    // Find the child node matching the capability tool name
+    const matchingChild = parentNode.dependencies.find(
+      (c) => c.name === toolName
+    );
+    return {
+      variableId: matchingChild?.variableId ?? -999,
+      uniqueId: matchingChild?.uniqueId ?? '',
+    };
+  }
+
+  /**
+   * Converts a JSON Schema object to a Zod schema for DynamicStructuredTool.
+   * Handles common JSON Schema types used by capability tool definitions.
+   */
+  private jsonSchemaToZod(
+    jsonSchema: Record<string, unknown>
+  ): z.ZodObject<z.ZodRawShape> {
+    const properties = (
+      jsonSchema as { properties?: Record<string, Record<string, unknown>> }
+    ).properties;
+    const required = (jsonSchema as { required?: string[] }).required ?? [];
+
+    if (!properties || Object.keys(properties).length === 0) {
+      return z.object({});
+    }
+
+    const shape: z.ZodRawShape = {};
+    for (const [key, prop] of Object.entries(properties)) {
+      let fieldSchema: z.ZodTypeAny;
+
+      switch (prop.type) {
+        case 'string':
+          fieldSchema = z.string();
+          if (prop.description)
+            fieldSchema = fieldSchema.describe(prop.description as string);
+          break;
+        case 'number':
+        case 'integer':
+          fieldSchema = z.number();
+          if (prop.description)
+            fieldSchema = fieldSchema.describe(prop.description as string);
+          break;
+        case 'boolean':
+          fieldSchema = z.boolean();
+          if (prop.description)
+            fieldSchema = fieldSchema.describe(prop.description as string);
+          break;
+        case 'array':
+          fieldSchema = z.array(z.unknown());
+          if (prop.description)
+            fieldSchema = fieldSchema.describe(prop.description as string);
+          break;
+        default:
+          fieldSchema = z.unknown();
+          if (prop.description)
+            fieldSchema = fieldSchema.describe(prop.description as string);
+          break;
+      }
+
+      if (!required.includes(key)) {
+        fieldSchema = fieldSchema.optional();
+      }
+
+      shape[key] = fieldSchema;
+    }
+
+    return z.object(shape);
   }
 
   /**
@@ -1084,7 +1536,8 @@ export class AIAgentBubble extends ServiceBubble<
       const tool = tools.find((t) => t.name === toolCall.name);
       if (!tool) {
         console.warn(`Tool ${toolCall.name} not found`);
-        const errorContent = `Error: Tool ${toolCall.name} not found`;
+        const availableToolNames = tools.map((t) => t.name).join(', ');
+        const errorContent = `Error: Tool "${toolCall.name}" not found. Available tools: ${availableToolNames}`;
         const startTime = Date.now();
 
         // Send tool_start event (include variableId for console tracking)
@@ -1111,12 +1564,12 @@ export class AIAgentBubble extends ServiceBubble<
           },
         });
 
-        toolMessages.push(
-          new ToolMessage({
-            content: errorContent,
-            tool_call_id: toolCall.id!,
-          })
-        );
+        const errorMessage = new ToolMessage({
+          content: errorContent,
+          tool_call_id: toolCall.id!,
+        });
+        toolMessages.push(errorMessage);
+        currentMessages = [...currentMessages, errorMessage];
         continue;
       }
 

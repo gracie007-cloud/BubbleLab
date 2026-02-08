@@ -529,8 +529,16 @@ const SlackParamsSchema = z.discriminatedUnion('operation', [
       ),
     file_path: z
       .string()
-      .min(1, 'File path is required')
-      .describe('Local file path to upload'),
+      .optional()
+      .describe(
+        'Local file path to upload (provide either file_path or content)'
+      ),
+    content: z
+      .string()
+      .optional()
+      .describe(
+        'Base64-encoded file content to upload (provide either file_path or content)'
+      ),
     filename: z
       .string()
       .optional()
@@ -1557,8 +1565,8 @@ Comprehensive Slack integration for messaging and workspace management.
     if (username) body.username = username;
     if (icon_emoji) body.icon_emoji = icon_emoji;
     if (icon_url) body.icon_url = icon_url;
-    if (attachments) body.attachments = JSON.stringify(attachments);
-    if (finalBlocks) body.blocks = JSON.stringify(finalBlocks);
+    if (attachments) body.attachments = attachments;
+    if (finalBlocks) body.blocks = finalBlocks;
     if (thread_ts) {
       body.thread_ts = thread_ts;
       body.reply_broadcast = reply_broadcast;
@@ -1631,7 +1639,7 @@ Comprehensive Slack integration for messaging and workspace management.
         text: isFirstChunk
           ? text
           : `(continued ${chunkIndex + 1}/${blockChunks.length})`,
-        blocks: JSON.stringify(chunk),
+        blocks: chunk,
         unfurl_links: options.unfurl_links,
         unfurl_media: options.unfurl_media,
       };
@@ -1652,7 +1660,7 @@ Comprehensive Slack integration for messaging and workspace management.
 
       // Only include attachments in the first message
       if (isFirstChunk && options.attachments) {
-        body.attachments = JSON.stringify(options.attachments);
+        body.attachments = options.attachments;
       }
 
       const response = await this.makeSlackApiCall('chat.postMessage', body);
@@ -1958,8 +1966,8 @@ Comprehensive Slack integration for messaging and workspace management.
     };
 
     if (text) body.text = text;
-    if (attachments) body.attachments = JSON.stringify(attachments);
-    if (blocks) body.blocks = JSON.stringify(blocks);
+    if (attachments) body.attachments = attachments;
+    if (blocks) body.blocks = blocks;
 
     const response = await this.makeSlackApiCall('chat.update', body);
 
@@ -2054,8 +2062,15 @@ Comprehensive Slack integration for messaging and workspace management.
   private async uploadFile(
     params: Extract<SlackParams, { operation: 'upload_file' }>
   ): Promise<Extract<SlackResult, { operation: 'upload_file' }>> {
-    const { channel, file_path, filename, title, initial_comment, thread_ts } =
-      params;
+    const {
+      channel,
+      file_path,
+      content,
+      filename,
+      title,
+      initial_comment,
+      thread_ts,
+    } = params;
 
     // Resolve channel name to ID if needed
     const resolvedChannel = await this.resolveChannelId(channel);
@@ -2065,8 +2080,15 @@ Comprehensive Slack integration for messaging and workspace management.
     const path = await import('path');
 
     try {
-      const fileBuffer = await fs.readFile(file_path);
-      const actualFilename = filename || path.basename(file_path);
+      if (!file_path && !content) {
+        throw new Error('Either file_path or content must be provided');
+      }
+
+      const fileBuffer = content
+        ? Buffer.from(content, 'base64')
+        : await fs.readFile(file_path!);
+      const actualFilename =
+        filename || (file_path ? path.basename(file_path) : 'file');
       const fileSize = fileBuffer.length;
 
       // Step 1: Get upload URL
@@ -2259,7 +2281,7 @@ Comprehensive Slack integration for messaging and workspace management.
     };
 
     if (thread_ts) body.thread_ts = thread_ts;
-    if (blocks) body.blocks = JSON.stringify(blocks);
+    if (blocks) body.blocks = blocks;
     if (unfurl_links !== undefined) body.unfurl_links = unfurl_links;
     if (unfurl_media !== undefined) body.unfurl_media = unfurl_media;
 
@@ -2491,8 +2513,11 @@ Comprehensive Slack integration for messaging and workspace management.
       throw new Error('No slack credentials provided');
     }
 
-    // Slack bubble always uses Slack credentials
-    return credentials[CredentialType.SLACK_CRED];
+    // Prefer OAuth credential, fall back to API key
+    return (
+      credentials[CredentialType.SLACK_CRED] ??
+      credentials[CredentialType.SLACK_API]
+    );
   }
 
   private async makeSlackApiCall(
@@ -2544,9 +2569,11 @@ Comprehensive Slack integration for messaging and workspace management.
       return data;
     } else {
       // Most Slack POST endpoints expect form-encoded data, not JSON
-      // Only specific endpoints like chat.postMessage with blocks expect JSON
+      // Endpoints with structured payloads (blocks, attachments) need JSON
       const needsJson =
-        ['chat.postMessage', 'chat.update'].includes(endpoint) &&
+        ['chat.postMessage', 'chat.update', 'chat.scheduleMessage'].includes(
+          endpoint
+        ) &&
         (params.blocks || params.attachments);
 
       if (needsJson) {
@@ -2560,7 +2587,11 @@ Comprehensive Slack integration for messaging and workspace management.
         const formData = new URLSearchParams();
         for (const [key, value] of Object.entries(params)) {
           if (value !== undefined && value !== null) {
-            formData.append(key, String(value));
+            // Serialize objects/arrays as JSON strings for form-encoded
+            formData.append(
+              key,
+              typeof value === 'object' ? JSON.stringify(value) : String(value)
+            );
           }
         }
         fetchConfig = {

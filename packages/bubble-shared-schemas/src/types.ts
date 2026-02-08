@@ -18,6 +18,7 @@ export enum CredentialType {
   DATABASE_CRED = 'DATABASE_CRED',
   // Communication Credentials
   SLACK_CRED = 'SLACK_CRED',
+  SLACK_API = 'SLACK_API',
   TELEGRAM_BOT_TOKEN = 'TELEGRAM_BOT_TOKEN',
   // Email Credentials
   RESEND_CRED = 'RESEND_CRED',
@@ -38,6 +39,7 @@ export enum CredentialType {
   GOOGLE_CALENDAR_CRED = 'GOOGLE_CALENDAR_CRED',
   FUB_CRED = 'FUB_CRED',
   NOTION_OAUTH_TOKEN = 'NOTION_OAUTH_TOKEN',
+  NOTION_API = 'NOTION_API',
   AIRTABLE_OAUTH = 'AIRTABLE_OAUTH',
 
   // Development Platform Credentials
@@ -92,6 +94,7 @@ export type BubbleName =
   | 'get-bubble-details-tool'
   | 'get-trigger-detail-tool'
   | 'list-bubbles-tool'
+  | 'list-capabilities-tool'
   | 'sql-query-tool'
   | 'chart-js-tool'
   | 'web-search-tool'

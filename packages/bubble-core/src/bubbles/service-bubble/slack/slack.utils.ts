@@ -32,11 +32,45 @@ export interface SlackContextBlock {
   elements: SlackTextObject[];
 }
 
+export interface SlackTableCellRawText {
+  type: 'raw_text';
+  text: string;
+}
+
+export interface SlackTableCellRichText {
+  type: 'rich_text';
+  elements: unknown[];
+}
+
+export type SlackTableCell = SlackTableCellRawText | SlackTableCellRichText;
+
+export interface SlackTableColumnSetting {
+  align?: 'left' | 'center' | 'right';
+  is_wrapped?: boolean;
+}
+
+export interface SlackTableBlock {
+  type: 'table';
+  rows: SlackTableCell[][];
+  column_settings?: SlackTableColumnSetting[];
+  block_id?: string;
+}
+
+export interface SlackImageBlock {
+  type: 'image';
+  image_url: string;
+  alt_text: string;
+  title?: SlackTextObject;
+  block_id?: string;
+}
+
 export type SlackBlock =
   | SlackSectionBlock
   | SlackDividerBlock
   | SlackHeaderBlock
-  | SlackContextBlock;
+  | SlackContextBlock
+  | SlackTableBlock
+  | SlackImageBlock;
 
 /**
  * Options for markdown to blocks conversion
@@ -135,11 +169,42 @@ export function markdownToMrkdwn(markdown: string): string {
  * Parses markdown content and identifies different block types.
  * Returns an array of parsed blocks with their types and content.
  */
+/**
+ * Image hosting domains whose URLs should render as Slack image blocks
+ * instead of raw URL text.
+ */
+const IMAGE_URL_HOSTS = ['quickchart.io', 'i.imgur.com', 'imgur.com'];
+const IMAGE_URL_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'];
+
+/**
+ * Checks if a URL points to an image that should be rendered as an image block.
+ */
+function isImageUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (IMAGE_URL_HOSTS.some((h) => parsed.hostname.endsWith(h))) return true;
+    const path = parsed.pathname.toLowerCase();
+    return IMAGE_URL_EXTENSIONS.some((ext) => path.endsWith(ext));
+  } catch {
+    return false;
+  }
+}
+
 interface ParsedBlock {
-  type: 'header' | 'paragraph' | 'code' | 'divider' | 'quote' | 'list';
+  type:
+    | 'header'
+    | 'paragraph'
+    | 'code'
+    | 'divider'
+    | 'quote'
+    | 'list'
+    | 'table'
+    | 'image';
   content: string;
   level?: number; // For headers (1-6)
   language?: string; // For code blocks
+  tableHeaders?: string[]; // For table blocks
+  tableRows?: string[][]; // For table blocks
 }
 
 /**
@@ -150,12 +215,13 @@ function normalizeMarkdownNewlines(markdown: string): string {
   let result = markdown;
 
   // Add newlines before headers (### Header) if not already at line start
-  // Lookbehind ensures we don't add newline if already at start or after newline
-  result = result.replace(/([^\n])(#{1,6}\s+\S)/g, '$1\n$2');
+  // Exclude # so multi-hash headers like ### don't get split into # + \n##
+  result = result.replace(/([^\n#])(#{1,6}\s+\S)/g, '$1\n$2');
 
   // Add newlines before horizontal rules (--- or ***)
+  // Exclude table separator rows (preceded by | or : as in |:---|)
   result = result.replace(
-    /([^\n\s])\s*(---+|___+|\*\*\*+)\s*(?=\S|$)/g,
+    /([^\n\s|:])\s*(---+|___+|\*\*\*+)\s*(?=\S|$)/g,
     '$1\n$2\n'
   );
 
@@ -210,6 +276,36 @@ function parseMarkdownBlocks(markdown: string): ParsedBlock[] {
 
     if (inCodeBlock) {
       codeBlockContent.push(line);
+      continue;
+    }
+
+    // Check for bare URL on its own line (image URLs become image blocks)
+    const trimmedLine = line.trim();
+    if (/^https?:\/\/\S+$/.test(trimmedLine)) {
+      if (currentBlock) {
+        blocks.push(currentBlock);
+        currentBlock = null;
+      }
+      if (isImageUrl(trimmedLine)) {
+        blocks.push({ type: 'image', content: trimmedLine });
+      } else {
+        // Non-image URL: keep as paragraph, markdownToMrkdwn will leave it as-is
+        // Slack auto-unfurls URLs, so just pass through
+        blocks.push({ type: 'paragraph', content: trimmedLine });
+      }
+      continue;
+    }
+
+    // Check for table row (lines starting with |) — must come before divider detection
+    if (line.trimStart().startsWith('|')) {
+      if (currentBlock?.type !== 'table') {
+        if (currentBlock) {
+          blocks.push(currentBlock);
+        }
+        currentBlock = { type: 'table', content: line };
+      } else {
+        currentBlock.content += '\n' + line;
+      }
       continue;
     }
 
@@ -302,6 +398,29 @@ function parseMarkdownBlocks(markdown: string): ParsedBlock[] {
     });
   }
 
+  // Post-process table blocks: parse |..| lines into headers and rows
+  for (const block of blocks) {
+    if (block.type !== 'table') continue;
+    const tableLines = block.content.split('\n');
+    const parsedRows: string[][] = [];
+    for (const tl of tableLines) {
+      const trimmed = tl.trim();
+      // Skip separator rows like |---|---|
+      if (/^\|[\s\-:|]+\|$/.test(trimmed)) continue;
+      // Parse cells
+      const cells = trimmed
+        .replace(/^\|/, '')
+        .replace(/\|$/, '')
+        .split('|')
+        .map((c) => c.trim());
+      parsedRows.push(cells);
+    }
+    if (parsedRows.length > 0) {
+      block.tableHeaders = parsedRows[0];
+      block.tableRows = parsedRows.slice(1);
+    }
+  }
+
   return blocks;
 }
 
@@ -360,6 +479,7 @@ export function markdownToBlocks(
 
   const parsedBlocks = parseMarkdownBlocks(markdown.trim());
   const slackBlocks: SlackBlock[] = [];
+  let tableBlockUsed = false; // Slack allows only one table per message
 
   for (const block of parsedBlocks) {
     switch (block.type) {
@@ -437,6 +557,65 @@ export function markdownToBlocks(
           },
         });
         break;
+
+      case 'table': {
+        if (
+          !tableBlockUsed &&
+          block.tableHeaders &&
+          block.tableHeaders.length > 0 &&
+          block.tableRows &&
+          block.tableRows.length > 0
+        ) {
+          const result = createTableBlock(block.tableHeaders, block.tableRows);
+          slackBlocks.push(result.tableBlock);
+          tableBlockUsed = true;
+          if (result.wasTruncated) {
+            slackBlocks.push({
+              type: 'context',
+              elements: [
+                {
+                  type: 'mrkdwn' as const,
+                  text: `Showing ${SLACK_TABLE_MAX_ROWS - 1} of ${result.originalRowCount} rows`,
+                },
+              ],
+            });
+          }
+        } else {
+          // Second+ table or failed parse: render as code block
+          slackBlocks.push({
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: '```' + block.content + '```',
+            },
+          });
+        }
+        break;
+      }
+
+      case 'image': {
+        // Extract a readable title from the URL
+        let altText = 'Image';
+        try {
+          const parsed = new URL(block.content);
+          // Use title param or path-based label
+          const titleParam =
+            parsed.searchParams.get('title') || parsed.searchParams.get('text');
+          if (titleParam) {
+            altText = titleParam;
+          } else {
+            altText = `Chart from ${parsed.hostname}`;
+          }
+        } catch {
+          // keep default
+        }
+        slackBlocks.push({
+          type: 'image',
+          image_url: block.content,
+          alt_text: altText,
+        });
+        break;
+      }
 
       case 'paragraph':
       default: {
@@ -518,6 +697,114 @@ export function createContextBlock(texts: string[]): SlackContextBlock {
       type: 'mrkdwn' as const,
       text: markdownToMrkdwn(text),
     })),
+  };
+}
+
+/**
+ * Slack table block constraints
+ */
+export const SLACK_TABLE_MAX_ROWS = 100;
+export const SLACK_TABLE_MAX_COLUMNS = 20;
+
+export interface CreateTableBlockResult {
+  tableBlock: SlackTableBlock;
+  overflowCsv?: string;
+  wasTruncated: boolean;
+  originalRowCount: number;
+}
+
+function escapeCsvValue(value: string): string {
+  if (
+    value.includes(',') ||
+    value.includes('"') ||
+    value.includes('\n') ||
+    value.includes('\r')
+  ) {
+    return '"' + value.replace(/"/g, '""') + '"';
+  }
+  return value;
+}
+
+function generateCsv(headers: string[], rows: string[][]): string {
+  const lines: string[] = [];
+  lines.push(headers.map(escapeCsvValue).join(','));
+  for (const row of rows) {
+    lines.push(row.map(escapeCsvValue).join(','));
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Creates a Slack table block from headers and rows.
+ * Truncates to fit Slack's limits (100 rows including header, 20 columns).
+ * If rows exceed the limit, generates a CSV containing all data.
+ *
+ * @param headers - Column header strings
+ * @param rows - 2D array of cell values
+ * @param columnSettings - Optional column alignment/wrapping settings
+ * @returns Table block, optional CSV overflow, and truncation info
+ */
+export function createTableBlock(
+  headers: string[],
+  rows: string[][],
+  columnSettings?: SlackTableColumnSetting[]
+): CreateTableBlockResult {
+  const originalRowCount = rows.length;
+  const maxDataRows = SLACK_TABLE_MAX_ROWS - 1; // 1 row reserved for header
+
+  // Truncate columns if needed
+  const colCount = Math.min(headers.length, SLACK_TABLE_MAX_COLUMNS);
+  const truncatedHeaders = headers.slice(0, colCount);
+
+  // Truncate rows if needed
+  const wasTruncated = originalRowCount > maxDataRows;
+  const truncatedRows = rows.slice(0, maxDataRows);
+
+  // Build header row cells
+  const headerRowCells: SlackTableCellRawText[] = truncatedHeaders.map((h) => ({
+    type: 'raw_text' as const,
+    text: String(h),
+  }));
+
+  // Build data row cells, padding short rows with empty cells
+  const dataRowCells: SlackTableCellRawText[][] = truncatedRows.map((row) => {
+    const cells: SlackTableCellRawText[] = [];
+    for (let i = 0; i < colCount; i++) {
+      cells.push({
+        type: 'raw_text' as const,
+        text: i < row.length ? String(row[i]) : '',
+      });
+    }
+    return cells;
+  });
+
+  // Build column settings
+  let settings: SlackTableColumnSetting[] | undefined;
+  if (columnSettings) {
+    settings = columnSettings.slice(0, colCount);
+    // Pad with defaults if fewer settings than columns
+    while (settings.length < colCount) {
+      settings.push({});
+    }
+  }
+
+  const tableBlock: SlackTableBlock = {
+    type: 'table',
+    rows: [headerRowCells, ...dataRowCells],
+    ...(settings ? { column_settings: settings } : {}),
+  };
+
+  // Generate CSV for overflow
+  let overflowCsv: string | undefined;
+  if (wasTruncated) {
+    overflowCsv = generateCsv(headers, rows);
+  }
+
+  return {
+    tableBlock,
+    overflowCsv,
+    wasTruncated,
+    originalRowCount,
   };
 }
 

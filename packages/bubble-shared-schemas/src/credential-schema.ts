@@ -5,6 +5,8 @@ import {
   jiraOAuthMetadataSchema,
   slackOAuthMetadataSchema,
   airtableOAuthMetadataSchema,
+  googleOAuthMetadataSchema,
+  notionOAuthMetadataSchema,
   confluenceOAuthMetadataSchema,
   stripeOAuthMetadataSchema,
   credentialPreferencesSchema,
@@ -70,14 +72,21 @@ export const CREDENTIAL_TYPE_CONFIG: Record<CredentialType, CredentialConfig> =
       },
     },
     [CredentialType.SLACK_CRED]: {
-      label: 'Slack',
-      description:
-        'Slack Bot token (xoxb-) or User token (xoxp-) from api.slack.com/apps. Configure scopes in OAuth & Permissions.',
-      placeholder: 'xoxb-... or xoxp-...',
-      namePlaceholder: 'My Slack Token',
+      label: 'Slack (OAuth)',
+      description: 'OAuth connection to Slack workspace',
+      placeholder: '', // Not used for OAuth
+      namePlaceholder: 'My Slack Connection',
       credentialConfigurations: {
         ignoreSSL: false,
       },
+    },
+    [CredentialType.SLACK_API]: {
+      label: 'Slack',
+      description:
+        'Slack Bot token (xoxb-) or User token (xoxp-) from api.slack.com/apps',
+      placeholder: 'xoxb-... or xoxp-...',
+      namePlaceholder: 'My Slack Bot Token',
+      credentialConfigurations: {},
     },
     [CredentialType.RESEND_CRED]: {
       label: 'Resend',
@@ -178,11 +187,18 @@ export const CREDENTIAL_TYPE_CONFIG: Record<CredentialType, CredentialConfig> =
       credentialConfigurations: {},
     },
     [CredentialType.NOTION_OAUTH_TOKEN]: {
-      label: 'Notion',
+      label: 'Notion (OAuth)',
       description:
         'OAuth connection to your Notion workspace (pages, databases, search)',
       placeholder: '', // Not used for OAuth
       namePlaceholder: 'My Notion Connection',
+      credentialConfigurations: {},
+    },
+    [CredentialType.NOTION_API]: {
+      label: 'Notion (API Key)',
+      description: 'Internal Integration Token for Notion API access',
+      placeholder: 'ntn_...',
+      namePlaceholder: 'My Notion API Key',
       credentialConfigurations: {},
     },
     [CredentialType.GITHUB_TOKEN]: {
@@ -349,6 +365,7 @@ export const CREDENTIAL_ENV_MAP: Record<CredentialType, string> = {
   [CredentialType.FIRECRAWL_API_KEY]: 'FIRE_CRAWL_API_KEY',
   [CredentialType.DATABASE_CRED]: 'BUBBLE_CONNECTING_STRING_URL',
   [CredentialType.SLACK_CRED]: 'SLACK_TOKEN',
+  [CredentialType.SLACK_API]: 'SLACK_BOT_TOKEN',
   [CredentialType.TELEGRAM_BOT_TOKEN]: 'TELEGRAM_BOT_TOKEN',
   [CredentialType.RESEND_CRED]: 'RESEND_API_KEY',
   [CredentialType.OPENROUTER_CRED]: 'OPENROUTER_API_KEY',
@@ -367,6 +384,7 @@ export const CREDENTIAL_ENV_MAP: Record<CredentialType, string> = {
   [CredentialType.AIRTABLE_CRED]: 'AIRTABLE_API_KEY',
   [CredentialType.AIRTABLE_OAUTH]: '', // OAuth credential, no env var
   [CredentialType.NOTION_OAUTH_TOKEN]: '',
+  [CredentialType.NOTION_API]: 'NOTION_API_KEY',
   [CredentialType.INSFORGE_BASE_URL]: 'INSFORGE_BASE_URL',
   [CredentialType.INSFORGE_API_KEY]: 'INSFORGE_API_KEY',
   [CredentialType.CUSTOM_AUTH_KEY]: '', // User-provided, no env var
@@ -571,6 +589,9 @@ export const OAUTH_PROVIDERS: Record<OAuthProvider, OAuthProviderConfig> = {
         description:
           'Authorize access to your Notion workspace for searching and reading pages/databases',
       },
+    },
+    authorizationParams: {
+      owner: 'user',
     },
   },
   jira: {
@@ -1403,12 +1424,13 @@ export const BUBBLE_CREDENTIAL_OPTIONS: Record<
     CredentialType.OPENROUTER_CRED,
   ],
   postgresql: [CredentialType.DATABASE_CRED],
-  slack: [CredentialType.SLACK_CRED],
+  slack: [CredentialType.SLACK_CRED, CredentialType.SLACK_API],
   telegram: [CredentialType.TELEGRAM_BOT_TOKEN],
   resend: [CredentialType.RESEND_CRED],
   'database-analyzer': [CredentialType.DATABASE_CRED],
   'slack-notifier': [
     CredentialType.SLACK_CRED,
+    CredentialType.SLACK_API,
     CredentialType.OPENAI_CRED,
     CredentialType.GOOGLE_GEMINI_CRED,
     CredentialType.ANTHROPIC_CRED,
@@ -1421,6 +1443,7 @@ export const BUBBLE_CREDENTIAL_OPTIONS: Record<
   'slack-data-assistant': [
     CredentialType.DATABASE_CRED,
     CredentialType.SLACK_CRED,
+    CredentialType.SLACK_API,
     CredentialType.OPENAI_CRED,
     CredentialType.GOOGLE_GEMINI_CRED,
     CredentialType.ANTHROPIC_CRED,
@@ -1430,6 +1453,7 @@ export const BUBBLE_CREDENTIAL_OPTIONS: Record<
   'get-bubble-details-tool': [],
   'get-trigger-detail-tool': [],
   'list-bubbles-tool': [],
+  'list-capabilities-tool': [],
   'sql-query-tool': [CredentialType.DATABASE_CRED],
   'chart-js-tool': [],
   'bubbleflow-validation-tool': [],
@@ -1503,7 +1527,7 @@ export const BUBBLE_CREDENTIAL_OPTIONS: Record<
   followupboss: [CredentialType.FUB_CRED],
   'agi-inc': [CredentialType.AGI_API_KEY],
   airtable: [CredentialType.AIRTABLE_CRED, CredentialType.AIRTABLE_OAUTH],
-  notion: [CredentialType.NOTION_OAUTH_TOKEN],
+  notion: [CredentialType.NOTION_OAUTH_TOKEN, CredentialType.NOTION_API],
   firecrawl: [CredentialType.FIRECRAWL_API_KEY],
   'insforge-db': [
     CredentialType.INSFORGE_BASE_URL,
@@ -1646,6 +1670,8 @@ export const credentialResponseSchema = z
         jiraOAuthMetadataSchema,
         slackOAuthMetadataSchema,
         airtableOAuthMetadataSchema,
+        googleOAuthMetadataSchema,
+        notionOAuthMetadataSchema,
         confluenceOAuthMetadataSchema,
         stripeOAuthMetadataSchema,
         credentialPreferencesSchema,
@@ -1653,7 +1679,7 @@ export const credentialResponseSchema = z
       .optional()
       .openapi({
         description:
-          'Credential metadata (DatabaseMetadata, JiraOAuthMetadata, SlackOAuthMetadata, AirtableOAuthMetadata, ConfluenceOAuthMetadata, StripeOAuthMetadata, or CredentialPreferences)',
+          'Credential metadata (DatabaseMetadata, JiraOAuthMetadata, SlackOAuthMetadata, AirtableOAuthMetadata, GoogleOAuthMetadata, NotionOAuthMetadata, ConfluenceOAuthMetadata, StripeOAuthMetadata, or CredentialPreferences)',
       }),
     createdAt: z.string().openapi({ description: 'Creation timestamp' }),
 

@@ -6,9 +6,14 @@ import {
   createDividerBlock,
   createHeaderBlock,
   createContextBlock,
+  createTableBlock,
+  SLACK_TABLE_MAX_ROWS,
+  SLACK_TABLE_MAX_COLUMNS,
   type SlackSectionBlock,
   type SlackDividerBlock,
   type SlackHeaderBlock,
+  type SlackTableBlock,
+  type SlackContextBlock,
 } from './slack.utils.js';
 
 describe('markdownToMrkdwn', () => {
@@ -388,5 +393,382 @@ describe('helper functions', () => {
       const block = createContextBlock(['**Bold** text']);
       expect(block.elements[0].text).toBe('*Bold* text');
     });
+  });
+
+  describe('createTableBlock', () => {
+    it('should create a basic table block with correct structure', () => {
+      const result = createTableBlock(
+        ['Name', 'Age'],
+        [
+          ['Alice', '30'],
+          ['Bob', '25'],
+        ]
+      );
+      expect(result.tableBlock.type).toBe('table');
+      expect(result.tableBlock.rows).toHaveLength(3); // 1 header + 2 data
+      expect(result.wasTruncated).toBe(false);
+      expect(result.originalRowCount).toBe(2);
+      expect(result.overflowCsv).toBeUndefined();
+    });
+
+    it('should use raw_text cells for header row', () => {
+      const result = createTableBlock(['Col1', 'Col2'], [['a', 'b']]);
+      const headerRow = result.tableBlock.rows[0];
+      expect(headerRow[0]).toEqual({ type: 'raw_text', text: 'Col1' });
+      expect(headerRow[1]).toEqual({ type: 'raw_text', text: 'Col2' });
+    });
+
+    it('should apply and truncate column settings', () => {
+      const result = createTableBlock(
+        ['A', 'B'],
+        [['1', '2']],
+        [
+          { align: 'left', is_wrapped: true },
+          { align: 'right' },
+          { align: 'center' }, // extra setting — should be truncated
+        ]
+      );
+      expect(result.tableBlock.column_settings).toHaveLength(2);
+      expect(result.tableBlock.column_settings![0]).toEqual({
+        align: 'left',
+        is_wrapped: true,
+      });
+    });
+
+    it('should pad short rows with empty cells', () => {
+      const result = createTableBlock(
+        ['A', 'B', 'C'],
+        [['1']] // only one cell instead of 3
+      );
+      const dataRow = result.tableBlock.rows[1];
+      expect(dataRow).toHaveLength(3);
+      expect(dataRow[2]).toEqual({ type: 'raw_text', text: '' });
+    });
+
+    it('should truncate columns beyond 20', () => {
+      const headers = Array.from({ length: 25 }, (_, i) => `Col${i}`);
+      const rows = [Array.from({ length: 25 }, (_, i) => `val${i}`)];
+      const result = createTableBlock(headers, rows);
+      expect(result.tableBlock.rows[0]).toHaveLength(SLACK_TABLE_MAX_COLUMNS);
+      expect(result.tableBlock.rows[1]).toHaveLength(SLACK_TABLE_MAX_COLUMNS);
+    });
+
+    it('should truncate rows beyond 99 data rows and generate CSV', () => {
+      const headers = ['ID', 'Value'];
+      const rows = Array.from({ length: 150 }, (_, i) => [
+        String(i),
+        `val${i}`,
+      ]);
+      const result = createTableBlock(headers, rows);
+      expect(result.tableBlock.rows).toHaveLength(SLACK_TABLE_MAX_ROWS); // 1 header + 99 data
+      expect(result.wasTruncated).toBe(true);
+      expect(result.originalRowCount).toBe(150);
+      expect(result.overflowCsv).toBeDefined();
+    });
+
+    it('should generate CSV with proper escaping', () => {
+      const result = createTableBlock(
+        ['Name', 'Description'],
+        [
+          ['Alice', 'Has a "quote"'],
+          ['Bob', 'Has a, comma'],
+          ['Charlie', 'Has a\nnewline'],
+        ]
+        // Force overflow by not actually overflowing — test CSV content via manual overflow
+      );
+      // No overflow for 3 rows, so test the CSV helpers indirectly
+      // by creating an overflow scenario
+      const bigRows = Array.from({ length: 100 }, (_, i) => [
+        `Name${i}`,
+        i === 0 ? 'Has "quotes", commas' : `Desc${i}`,
+      ]);
+      const overflowResult = createTableBlock(['Name', 'Description'], bigRows);
+      expect(overflowResult.overflowCsv).toBeDefined();
+      expect(overflowResult.overflowCsv).toContain('Name,Description');
+      expect(overflowResult.overflowCsv).toContain('"Has ""quotes"", commas"');
+    });
+
+    it('should not generate CSV when rows are within limit', () => {
+      const rows = Array.from({ length: 99 }, (_, i) => [String(i)]);
+      const result = createTableBlock(['ID'], rows);
+      expect(result.wasTruncated).toBe(false);
+      expect(result.overflowCsv).toBeUndefined();
+    });
+
+    it('should handle empty rows array', () => {
+      const result = createTableBlock(['A', 'B'], []);
+      expect(result.tableBlock.rows).toHaveLength(1); // header only
+      expect(result.wasTruncated).toBe(false);
+      expect(result.originalRowCount).toBe(0);
+    });
+
+    it('should handle single column', () => {
+      const result = createTableBlock(['Only'], [['one'], ['two']]);
+      expect(result.tableBlock.rows[0]).toHaveLength(1);
+      expect(result.tableBlock.rows[1]).toHaveLength(1);
+    });
+
+    it('should handle exactly 99 data rows without truncation', () => {
+      const rows = Array.from({ length: 99 }, (_, i) => [String(i)]);
+      const result = createTableBlock(['ID'], rows);
+      expect(result.tableBlock.rows).toHaveLength(100); // 1 header + 99
+      expect(result.wasTruncated).toBe(false);
+    });
+
+    it('should handle exactly 100 data rows with truncation', () => {
+      const rows = Array.from({ length: 100 }, (_, i) => [String(i)]);
+      const result = createTableBlock(['ID'], rows);
+      expect(result.tableBlock.rows).toHaveLength(100); // 1 header + 99
+      expect(result.wasTruncated).toBe(true);
+      expect(result.originalRowCount).toBe(100);
+    });
+
+    it('should pad column settings if fewer than column count', () => {
+      const result = createTableBlock(
+        ['A', 'B', 'C'],
+        [['1', '2', '3']],
+        [{ align: 'left' }]
+      );
+      expect(result.tableBlock.column_settings).toHaveLength(3);
+      expect(result.tableBlock.column_settings![0]).toEqual({ align: 'left' });
+      expect(result.tableBlock.column_settings![1]).toEqual({});
+    });
+  });
+});
+
+describe('markdownToBlocks with tables', () => {
+  it('should convert a simple markdown table to a table block', () => {
+    const md = `| Name | Age |
+| --- | --- |
+| Alice | 30 |
+| Bob | 25 |`;
+    const blocks = markdownToBlocks(md);
+    const tableBlock = blocks.find(
+      (b) => b.type === 'table'
+    ) as SlackTableBlock;
+    expect(tableBlock).toBeDefined();
+    expect(tableBlock.rows).toHaveLength(3); // 1 header + 2 data
+    expect(tableBlock.rows[0][0]).toEqual({ type: 'raw_text', text: 'Name' });
+    expect(tableBlock.rows[0][1]).toEqual({ type: 'raw_text', text: 'Age' });
+    expect(tableBlock.rows[1][0]).toEqual({ type: 'raw_text', text: 'Alice' });
+  });
+
+  it('should parse table with separator line correctly', () => {
+    const md = `| Col1 | Col2 |
+|:---|---:|
+| a | b |`;
+    const blocks = markdownToBlocks(md);
+    const tableBlock = blocks.find(
+      (b) => b.type === 'table'
+    ) as SlackTableBlock;
+    expect(tableBlock).toBeDefined();
+    // Separator should be skipped
+    expect(tableBlock.rows).toHaveLength(2); // 1 header + 1 data
+  });
+
+  it('should handle table mixed with other content', () => {
+    const md = `# Report
+
+Some text here.
+
+| Name | Value |
+| --- | --- |
+| X | 1 |
+
+More text.`;
+    const blocks = markdownToBlocks(md);
+    expect(blocks.some((b) => b.type === 'section')).toBe(true);
+    expect(blocks.some((b) => b.type === 'table')).toBe(true);
+  });
+
+  it('should render second table as code block', () => {
+    const md = `| A | B |
+| --- | --- |
+| 1 | 2 |
+
+| C | D |
+| --- | --- |
+| 3 | 4 |`;
+    const blocks = markdownToBlocks(md);
+    const tableBlocks = blocks.filter((b) => b.type === 'table');
+    expect(tableBlocks).toHaveLength(1); // Only first table
+    // Second table should be a code block (section with ```)
+    const codeBlocks = blocks.filter(
+      (b): b is SlackSectionBlock =>
+        b.type === 'section' && b.text.text.startsWith('```')
+    );
+    expect(codeBlocks.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('should truncate table with >20 columns', () => {
+    const headers = Array.from({ length: 25 }, (_, i) => `C${i}`);
+    const headerLine = '| ' + headers.join(' | ') + ' |';
+    const sepLine = '| ' + headers.map(() => '---').join(' | ') + ' |';
+    const dataLine = '| ' + headers.map((_, i) => `v${i}`).join(' | ') + ' |';
+    const md = `${headerLine}\n${sepLine}\n${dataLine}`;
+    const blocks = markdownToBlocks(md);
+    const tableBlock = blocks.find(
+      (b) => b.type === 'table'
+    ) as SlackTableBlock;
+    expect(tableBlock).toBeDefined();
+    expect(tableBlock.rows[0]).toHaveLength(SLACK_TABLE_MAX_COLUMNS);
+  });
+
+  it('should convert real-world AI response with table to valid blocks', () => {
+    const md = `Sure thing, Diana! Here are the top 5 users based on their monthly usage activity and total workflows created:
+
+| Name | Email | Monthly Usage | Workflows |
+| :--- | :--- | :--- | :--- |
+| Alice Park | alice.park@gmail.com | 1,655 | 16 |
+| Bob Chen | bob.chen@acmerobotics.ai | 769 | 6 |
+| Charlie Kim | charlie.kim@example.com | 719 | 67 |
+| Diana Lee | diana.lee@example.com | 445 | 720 |
+| Eve Martinez | eve.martinez@hotmail.com | 288 | 6 |
+
+It looks like you've been busy with those 720 workflows!
+
+**Fun Fact:** The world's oldest known recipe is for beer, dating back to 1800 BC in ancient Mesopotamia.`;
+
+    const blocks = markdownToBlocks(md);
+
+    // Should have: intro section, table, outro section, fun fact section
+    expect(blocks.length).toBeGreaterThanOrEqual(3);
+
+    // First block should be the intro text
+    expect(blocks[0].type).toBe('section');
+    expect((blocks[0] as SlackSectionBlock).text.text).toContain('Diana');
+
+    // Should have a table block
+    const tableBlock = blocks.find(
+      (b) => b.type === 'table'
+    ) as SlackTableBlock;
+    expect(tableBlock).toBeDefined();
+
+    // Table should have 1 header + 5 data rows = 6 rows
+    expect(tableBlock.rows).toHaveLength(6);
+
+    // Header row
+    expect(tableBlock.rows[0]).toHaveLength(4);
+    expect(tableBlock.rows[0][0]).toEqual({ type: 'raw_text', text: 'Name' });
+    expect(tableBlock.rows[0][1]).toEqual({ type: 'raw_text', text: 'Email' });
+    expect(tableBlock.rows[0][2]).toEqual({
+      type: 'raw_text',
+      text: 'Monthly Usage',
+    });
+    expect(tableBlock.rows[0][3]).toEqual({
+      type: 'raw_text',
+      text: 'Workflows',
+    });
+
+    // First data row
+    expect(tableBlock.rows[1][0]).toEqual({
+      type: 'raw_text',
+      text: 'Alice Park',
+    });
+    expect(tableBlock.rows[1][1]).toEqual({
+      type: 'raw_text',
+      text: 'alice.park@gmail.com',
+    });
+    expect(tableBlock.rows[1][2]).toEqual({
+      type: 'raw_text',
+      text: '1,655',
+    });
+    expect(tableBlock.rows[1][3]).toEqual({ type: 'raw_text', text: '16' });
+
+    // All cells should have non-empty text
+    for (const row of tableBlock.rows) {
+      for (const cell of row) {
+        expect(
+          (cell as { type: string; text: string }).text.length
+        ).toBeGreaterThan(0);
+      }
+    }
+
+    // Should have outro text
+    const outroBlock = blocks.find(
+      (b): b is SlackSectionBlock =>
+        b.type === 'section' && b.text.text.includes('720 workflows')
+    );
+    expect(outroBlock).toBeDefined();
+  });
+
+  it('should convert AI response with table and numbered list to valid blocks', () => {
+    const md = `Sure thing, dad! Here is a table of the 5 most recent users from our database:
+
+| First Name | Last Name | Email | Created At | Monthly Usage |
+| :--- | :--- | :--- | :--- | :--- |
+| Frank | Miller | frank.miller@gmail.com | 2026-02-07 | 0 |
+| Grace | Patel | grace.patel@gmail.com | 2026-02-07 | 1 |
+| Henry | Wilson | henry.wilson@gmail.com | 2026-02-07 | 0 |
+| Iris | Chang | iris.chang@gmail.com | 2026-02-07 | 4 |
+| Jack | Thompson | jack.thompson@gmail.com | 2026-02-07 | 2 |
+
+**Tool Usage & Reasoning:**
+
+1. **\`schema-query-tool (list_tables)\`**: I first checked the available tables to locate the user data.
+2. **\`schema-query-tool (describe_table)\`**: I inspected the \`users\` table schema to ensure I had the correct column names for the table.
+3. **\`sql-query-tool\`**: I executed a query to fetch the five most recently created accounts, ordered by \`created_at\` descending, to provide you with the latest activity.
+
+**Fun Fact:** A group of flamingos is called a "flamboyance".`;
+
+    const blocks = markdownToBlocks(md);
+
+    // Should have a table block
+    const tableBlock = blocks.find(
+      (b) => b.type === 'table'
+    ) as SlackTableBlock;
+    expect(tableBlock).toBeDefined();
+
+    // Table should have 1 header + 5 data rows = 6 rows
+    expect(tableBlock.rows).toHaveLength(6);
+
+    // 5 columns
+    expect(tableBlock.rows[0]).toHaveLength(5);
+    expect(tableBlock.rows[0][0]).toEqual({
+      type: 'raw_text',
+      text: 'First Name',
+    });
+    expect(tableBlock.rows[0][4]).toEqual({
+      type: 'raw_text',
+      text: 'Monthly Usage',
+    });
+
+    // First data row
+    expect(tableBlock.rows[1][0]).toEqual({ type: 'raw_text', text: 'Frank' });
+    expect(tableBlock.rows[1][2]).toEqual({
+      type: 'raw_text',
+      text: 'frank.miller@gmail.com',
+    });
+
+    // All cells should have non-empty text
+    for (const row of tableBlock.rows) {
+      for (const cell of row) {
+        expect(
+          (cell as { type: string; text: string }).text.length
+        ).toBeGreaterThan(0);
+      }
+    }
+
+    // Should have the numbered list content
+    const listOrSectionBlocks = blocks.filter(
+      (b): b is SlackSectionBlock =>
+        b.type === 'section' && b.text.text.includes('schema-query-tool')
+    );
+    expect(listOrSectionBlocks.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('should add context block when table is truncated', () => {
+    const headers = ['ID', 'Val'];
+    const headerLine = '| ' + headers.join(' | ') + ' |';
+    const sepLine = '| --- | --- |';
+    const dataLines = Array.from({ length: 110 }, (_, i) => `| ${i} | v${i} |`);
+    const md = [headerLine, sepLine, ...dataLines].join('\n');
+    const blocks = markdownToBlocks(md);
+    const contextBlock = blocks.find(
+      (b) => b.type === 'context'
+    ) as SlackContextBlock;
+    expect(contextBlock).toBeDefined();
+    expect(contextBlock.elements[0].text).toContain('99');
+    expect(contextBlock.elements[0].text).toContain('110');
   });
 });

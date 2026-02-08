@@ -4,6 +4,9 @@ export * from '@bubblelab/shared-schemas';
 export * from './types/credentials.js';
 export * from './types/available-tools.js';
 
+// Export capabilities framework
+export * from './capabilities/index.js';
+
 // Export error classes
 export {
   BubbleError,
@@ -120,6 +123,7 @@ export { ParseDocumentWorkflow } from './bubbles/workflow-bubble/parse-document.
 
 // Export tool bubbles
 export { ListBubblesTool } from './bubbles/tool-bubble/list-bubbles-tool.js';
+export { ListCapabilitiesTool } from './bubbles/tool-bubble/list-capabilities-tool.js';
 export { GetBubbleDetailsTool } from './bubbles/tool-bubble/get-bubble-details-tool.js';
 export { GetTriggerDetailTool } from './bubbles/tool-bubble/get-trigger-detail-tool.js';
 export { ListAirtableBasesTool } from './bubbles/tool-bubble/list-airtable-bases-tool.js';
@@ -181,6 +185,7 @@ export type {
   YCCompany,
   YCFounder,
 } from './bubbles/tool-bubble/yc-scraper-tool.js';
+export { ChartJSTool } from './bubbles/tool-bubble/chart-js-tool.js';
 
 // Export factory (this is the main way to access bubbles)
 export {
