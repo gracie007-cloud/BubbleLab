@@ -8,7 +8,40 @@ import { CredentialType, type BubbleName } from './types.js';
 export type CapabilityId =
   | 'knowledge-base'
   | 'google-doc-knowledge-base'
-  | 'data-analyst';
+  | 'data-analyst'
+  | 'chart-maker'
+  | 'gmail-assistant'
+  | 'google-calendar'
+  | 'jira-assistant'
+  | 'notion-assistant'
+  | 'stripe-assistant'
+  | 'airtable-assistant'
+  | 'github-assistant'
+  | 'ashby-assistant'
+  | 'google-sheets-assistant'
+  | 'slack-assistant'
+  | 'google-docs-assistant'
+  | 'google-drive-assistant'
+  | 'confluence-assistant'
+  | 'telegram-assistant'
+  | 'resend-assistant'
+  | 'eleven-labs-assistant'
+  | 'firecrawl-assistant'
+  | 'apify-assistant'
+  | 'browserbase-assistant'
+  | 'crustdata-assistant'
+  | 'fullenrich-assistant'
+  | 'followupboss-assistant'
+  | 'posthog-assistant'
+  | 'linear-assistant'
+  | 'attio-assistant'
+  | 'hubspot-assistant'
+  | 'flow-assistant'
+  | 'research-assistant'
+  | 'sortly-assistant'
+  | 'assembled-assistant'
+  | 'xero-assistant'
+  | 'ramp-assistant';
 
 /**
  * Schema for a provider entry in a capability's metadata.
@@ -50,6 +83,10 @@ export const CapabilityToolDefSchema = z.object({
   parameterSchema: z.record(z.string(), z.unknown()),
   /** Bubble names used internally by this tool (e.g., ['google-drive']). Used for dependency graph hierarchy. */
   internalBubbles: z.array(z.string() as z.ZodType<BubbleName>).optional(),
+  /** Whether this tool requires human approval before execution. */
+  requiresApproval: z.boolean().optional(),
+  /** Expose this tool directly on the master agent in multi-capability delegation mode. */
+  masterTool: z.boolean().optional(),
 });
 export type CapabilityToolDef = z.infer<typeof CapabilityToolDefSchema>;
 
@@ -58,8 +95,9 @@ export type CapabilityToolDef = z.infer<typeof CapabilityToolDefSchema>;
  */
 export const CapabilityModelConfigOverrideSchema = z.object({
   model: z.string().optional(),
-  reasoningEffort: z.enum(['low', 'medium', 'high']).optional(),
+  reasoningEffort: z.enum(['low', 'medium', 'high', 'none']).optional(),
   maxTokens: z.number().positive().optional(),
+  maxIterations: z.number().positive().optional(),
 });
 export type CapabilityModelConfigOverride = z.infer<
   typeof CapabilityModelConfigOverrideSchema

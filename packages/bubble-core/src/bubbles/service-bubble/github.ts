@@ -431,6 +431,40 @@ const GithubParamsSchema = z.discriminatedUnion('operation', [
       ),
   }),
 
+  // Create issue operation
+  z.object({
+    operation: z
+      .literal('create_issue')
+      .describe('Create a new issue in a GitHub repository'),
+    owner: z
+      .string()
+      .min(1, 'Repository owner is required')
+      .describe('Repository owner (username or organization name)'),
+    repo: z
+      .string()
+      .min(1, 'Repository name is required')
+      .describe('Repository name'),
+    title: z.string().min(1, 'Issue title is required').describe('Issue title'),
+    body: z
+      .string()
+      .optional()
+      .describe('Issue body content (supports GitHub Markdown)'),
+    labels: z
+      .array(z.string())
+      .optional()
+      .describe('Array of label names to add to the issue'),
+    assignees: z
+      .array(z.string())
+      .optional()
+      .describe('Array of usernames to assign to the issue'),
+    credentials: z
+      .record(z.nativeEnum(CredentialType), z.string())
+      .optional()
+      .describe(
+        'Object mapping credential types to values (injected at runtime)'
+      ),
+  }),
+
   // List issues operation
   z.object({
     operation: z
@@ -557,6 +591,14 @@ const GithubResultSchema = z.discriminatedUnion('operation', [
     })
     .merge(GithubCommentSchema.partial()),
 
+  z
+    .object({
+      operation: z.literal('create_issue'),
+      success: z.boolean().describe('Whether the operation succeeded'),
+      error: z.string().describe('Error message if operation failed'),
+    })
+    .merge(GithubIssueSchema.partial()),
+
   z.object({
     operation: z.literal('list_issues'),
     success: z.boolean().describe('Whether the operation succeeded'),
@@ -604,6 +646,10 @@ export type GithubCreateIssueCommentParams = Extract<
   GithubParams,
   { operation: 'create_issue_comment' }
 >;
+export type GithubCreateIssueParams = Extract<
+  GithubParams,
+  { operation: 'create_issue' }
+>;
 export type GithubListIssuesParams = Extract<
   GithubParams,
   { operation: 'list_issues' }
@@ -634,9 +680,9 @@ export class GithubBubble<
     - Get file contents from repositories
     - List and browse directory contents
     - Manage pull requests (list, get details, comment)
-    - Manage issues (list, comment)
+    - Manage issues (create, list, comment)
     - List and get repository information
-    - Non-sensitive read and comment operations only
+    - Safe read and write operations (no deletions)
     
     Use cases:
     - Code review automation and PR management
@@ -647,7 +693,7 @@ export class GithubBubble<
     
     Security Features:
     - Personal access token authentication (GitHub PAT)
-    - Read-only operations with safe comment capabilities
+    - Read and safe write operations (comments, issues)
     - No file deletion or destructive operations
     - Respects repository permissions
   `;
@@ -665,26 +711,24 @@ export class GithubBubble<
   }
 
   public async testCredential(): Promise<boolean> {
-    try {
-      // Test the credential by fetching the authenticated user
-      const token = this.chooseCredential();
-      if (!token) {
-        return false;
-      }
-
-      const response = await fetch(`${GITHUB_API_BASE}/user`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
-        },
-      });
-
-      return response.ok;
-    } catch (error) {
-      console.error('GitHub credential test failed:', error);
-      return false;
+    const token = this.chooseCredential();
+    if (!token) {
+      throw new Error('GitHub credentials are required');
     }
+
+    const response = await fetch(`${GITHUB_API_BASE}/user`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GitHub API error (${response.status}): ${text}`);
+    }
+    return true;
   }
 
   protected chooseCredential(): string | undefined {
@@ -756,6 +800,11 @@ export class GithubBubble<
             GithubParams,
             { operation: 'create_issue_comment' }
           >
+        ) as Promise<Extract<GithubResult, { operation: T['operation'] }>>;
+
+      case 'create_issue':
+        return this.handleCreateIssue(
+          this.params as Extract<GithubParams, { operation: 'create_issue' }>
         ) as Promise<Extract<GithubResult, { operation: T['operation'] }>>;
 
       case 'list_issues':
@@ -1244,6 +1293,71 @@ export class GithubBubble<
     } catch (error) {
       return {
         operation: 'create_issue_comment',
+        success: false,
+        error:
+          error instanceof Error ? error.message : 'Unknown error occurred',
+      };
+    }
+  }
+
+  private async handleCreateIssue(
+    params: Extract<GithubParams, { operation: 'create_issue' }>
+  ): Promise<Extract<GithubResult, { operation: 'create_issue' }>> {
+    const parsed = GithubParamsSchema.parse(params);
+    const { owner, repo, title, body, labels, assignees } = parsed as Extract<
+      GithubParamsParsed,
+      { operation: 'create_issue' }
+    >;
+
+    try {
+      const token = this.chooseCredential();
+      if (!token) {
+        return {
+          operation: 'create_issue',
+          success: false,
+          error: 'GitHub token credential not found',
+        };
+      }
+
+      const url = `${GITHUB_API_BASE}/repos/${owner}/${repo}/issues`;
+
+      const requestBody: Record<string, unknown> = { title };
+      if (body) requestBody.body = body;
+      if (labels) requestBody.labels = labels;
+      if (assignees) requestBody.assignees = assignees;
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        return {
+          operation: 'create_issue',
+          success: false,
+          error: `GitHub API error: ${response.status} ${error}`,
+        };
+      }
+
+      const data = await response.json();
+      const validatedData = GithubIssueSchema.parse(data);
+
+      return {
+        operation: 'create_issue',
+        success: true,
+        error: '',
+        ...validatedData,
+      };
+    } catch (error) {
+      return {
+        operation: 'create_issue',
         success: false,
         error:
           error instanceof Error ? error.message : 'Unknown error occurred',

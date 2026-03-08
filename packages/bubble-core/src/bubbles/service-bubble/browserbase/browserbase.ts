@@ -1,7 +1,11 @@
 import puppeteer, { type Browser, type Page } from 'puppeteer-core';
 import { ServiceBubble } from '../../../types/service-bubble-class.js';
 import type { BubbleContext } from '../../../types/bubble.js';
-import { CredentialType } from '@bubblelab/shared-schemas';
+import {
+  CredentialType,
+  BROWSER_SESSION_PROVIDERS,
+  decodeCredentialPayload,
+} from '@bubblelab/shared-schemas';
 import {
   BrowserBaseParamsSchema,
   BrowserBaseResultSchema,
@@ -246,11 +250,7 @@ export class BrowserBaseBubble<
     credentialValue: string
   ): BrowserSessionData | null {
     try {
-      // Credential is base64-encoded JSON
-      const jsonString = Buffer.from(credentialValue, 'base64').toString(
-        'utf-8'
-      );
-      const parsed = JSON.parse(jsonString);
+      const parsed = decodeCredentialPayload(credentialValue);
       const validated = BrowserSessionDataSchema.safeParse(parsed);
       if (validated.success) {
         return validated.data;
@@ -264,6 +264,14 @@ export class BrowserBaseBubble<
       console.error('[BrowserBaseBubble] Failed to parse credential:', error);
       return null;
     }
+  }
+
+  /**
+   * Normalize proxy server to valid URL (BrowserBase requires http/https)
+   */
+  private normalizeProxyServer(server: string): string {
+    const s = server.trim();
+    return /^https?:\/\//i.test(s) ? s : `http://${s}`;
   }
 
   /**
@@ -297,7 +305,7 @@ export class BrowserBaseBubble<
         // External proxy
         const config: Record<string, unknown> = {
           type: 'external',
-          server: proxy.server,
+          server: this.normalizeProxyServer(proxy.server),
         };
         if (proxy.username) {
           config.username = proxy.username;
@@ -319,13 +327,9 @@ export class BrowserBaseBubble<
       return false;
     }
 
-    try {
-      // Test by listing projects (simple API call)
-      await this.browserbaseApi('/projects');
-      return true;
-    } catch {
-      return false;
-    }
+    // Test by listing projects (simple API call) — let errors propagate
+    await this.browserbaseApi('/projects');
+    return true;
   }
 
   protected async performAction(
@@ -360,6 +364,13 @@ export class BrowserBaseBubble<
           case 'type':
             return await this.typeText(
               parsedParams as Extract<BrowserBaseParams, { operation: 'type' }>
+            );
+          case 'select':
+            return await this.selectOption(
+              parsedParams as Extract<
+                BrowserBaseParams,
+                { operation: 'select' }
+              >
             );
           case 'evaluate':
             return await this.evaluate(
@@ -502,9 +513,61 @@ export class BrowserBaseBubble<
       browserSettings,
     };
 
-    // Apply proxy configuration
+    // Apply session timeout (BrowserBase: top-level, 60-21600 seconds)
+    if (params.timeout_seconds !== undefined) {
+      sessionRequestBody.timeout = params.timeout_seconds;
+    }
+
+    // Apply proxy configuration: params.proxies > embedded proxy in session credential
     if (params.proxies) {
       sessionRequestBody.proxies = this.buildProxyConfig(params.proxies);
+    } else if (params.credentials) {
+      // Check embedded proxy in session credentials (browser session types from BROWSER_SESSION_PROVIDERS)
+      const sessionCredTypes = Object.keys(
+        BROWSER_SESSION_PROVIDERS.browserbase.credentialTypes
+      ) as CredentialType[];
+      for (const credType of sessionCredTypes) {
+        const credValue = params.credentials[credType];
+        if (credValue) {
+          const sessionData = this.parseBrowserSessionCredential(credValue);
+          if (sessionData?.proxy?.server) {
+            const proxyConfig: Record<string, unknown> = {
+              type: 'external',
+              server: this.normalizeProxyServer(sessionData.proxy.server),
+            };
+            if (sessionData.proxy.username) {
+              proxyConfig.username = sessionData.proxy.username;
+            }
+            if (sessionData.proxy.password) {
+              proxyConfig.password = sessionData.proxy.password;
+            }
+            sessionRequestBody.proxies = [proxyConfig];
+            console.log(
+              `[BrowserBaseBubble] Using embedded proxy from ${credType}`
+            );
+            break;
+          }
+        }
+      }
+    }
+
+    // Log proxy config when present (helps verify proxies are properly received)
+    if (sessionRequestBody.proxies) {
+      const proxiesForLog =
+        sessionRequestBody.proxies === true
+          ? 'built-in (proxies: true)'
+          : Array.isArray(sessionRequestBody.proxies)
+            ? (sessionRequestBody.proxies as Record<string, unknown>[])
+                .map((p) =>
+                  p.type === 'browserbase'
+                    ? 'browserbase'
+                    : `external ${(p.server as string) ?? '?'}`
+                )
+                .join(', ')
+            : String(sessionRequestBody.proxies);
+      console.log(
+        `[BrowserBaseBubble] Proxies received for session: ${proxiesForLog}`
+      );
     }
 
     // Create session with context, stealth, and proxy settings
@@ -530,6 +593,54 @@ export class BrowserBaseBubble<
 
     const pages = await browser.pages();
     const page = pages[0] || (await browser.newPage());
+
+    // Override browser dialogs (alert, confirm, prompt, print) to prevent them
+    // from blocking automation. Uses CDP to auto-inject on every new document.
+    try {
+      const cdpClient = await page.createCDPSession();
+      await cdpClient.send('Page.addScriptToEvaluateOnNewDocument', {
+        source: `
+          window.alert = (msg) => console.log('Suppressed alert:', msg);
+          window.confirm = (msg) => { console.log('Suppressed confirm:', msg); return true; };
+          window.prompt = (msg, def) => { console.log('Suppressed prompt:', msg); return def || ''; };
+          window.print = () => console.log('Suppressed print dialog');
+        `,
+      });
+      // Also inject into current page immediately
+      await page.evaluate(() => {
+        /* eslint-disable @typescript-eslint/no-explicit-any */
+        const w = globalThis as any;
+        w.alert = (msg?: string) => console.log('Suppressed alert:', msg);
+        w.confirm = (msg?: string) => {
+          console.log('Suppressed confirm:', msg);
+          return true;
+        };
+        w.prompt = (msg?: string, def?: string) => {
+          console.log('Suppressed prompt:', msg);
+          return def || '';
+        };
+        w.print = () => console.log('Suppressed print dialog');
+      });
+    } catch (e) {
+      console.warn('[BrowserBaseBubble] Failed to inject dialog overrides:', e);
+    }
+
+    // Log exit IP when using proxies (helps verify proxy routing)
+    if (sessionRequestBody.proxies) {
+      try {
+        const ip = await page.evaluate(async () => {
+          const res = await fetch('https://api.ipify.org?format=json');
+          const json = await res.json();
+          return (json as { ip: string }).ip;
+        });
+        console.log(`[BrowserBaseBubble] Session ${sessionId} exit IP: ${ip}`);
+      } catch (e) {
+        console.warn(
+          '[BrowserBaseBubble] Failed to fetch exit IP for session:',
+          e
+        );
+      }
+    }
 
     // Only inject cookies if we created a new context (no existing contextId from param or credential)
     // When contextId exists, BrowserBase context handles cookie persistence automatically
@@ -684,6 +795,60 @@ export class BrowserBaseBubble<
 
     return {
       operation: 'type',
+      success: true,
+      error: '',
+    };
+  }
+
+  /**
+   * Select an option in a <select> element using Puppeteer's page.select()
+   */
+  private async selectOption(
+    params: Extract<BrowserBaseParams, { operation: 'select' }>
+  ): Promise<Extract<BrowserBaseResult, { operation: 'select' }>> {
+    const session = BrowserBaseBubble.activeSessions.get(params.session_id);
+    if (!session) {
+      return {
+        operation: 'select',
+        success: false,
+        error: 'Session not found. Call start_session first.',
+      };
+    }
+
+    await session.page.waitForSelector(params.selector, {
+      timeout: params.timeout,
+    });
+
+    // Use page.select() for native Puppeteer select handling
+    await session.page.select(params.selector, params.value);
+
+    // Also dispatch events via the native prototype setter to ensure
+    // React-controlled selects pick up the change. React uses an internal
+    // _valueTracker that must be reset before dispatching, otherwise React
+    // sees no change and skips the onChange handler.
+    const escapedSelector = params.selector.replace(/'/g, "\\'");
+    const escapedValue = params.value.replace(/'/g, "\\'");
+    await session.page.evaluate(`(() => {
+      const el = document.querySelector('${escapedSelector}');
+      if (el) {
+        // Reset React's internal _valueTracker
+        const tracker = el._valueTracker;
+        if (tracker) {
+          tracker.setValue('');
+        }
+        const nativeSelectSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLSelectElement.prototype, 'value'
+        );
+        if (nativeSelectSetter && nativeSelectSetter.set) {
+          nativeSelectSetter.set.call(el, '${escapedValue}');
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    })()`);
+
+    return {
+      operation: 'select',
       success: true,
       error: '',
     };
@@ -936,13 +1101,10 @@ export class BrowserBaseBubble<
       ); // Ensure non-negative
 
       // Track service usage for browser session duration based on API response
-      // Using AMAZON_CRED as service type with subService 'browserbase' to distinguish
-      // TODO: Consider adding BROWSERBASE_CRED as a new CredentialType for proper tracking
       if (this.context?.logger && sessionDurationMinutes > 0) {
         this.context.logger.addServiceUsage(
           {
-            service: CredentialType.AMAZON_CRED, // Using AMAZON_CRED as workaround - BrowserBase doesn't have its own CredentialType
-            subService: 'browserbase',
+            service: CredentialType.BROWSERBASE_CRED,
             unit: 'per_minute',
             usage: sessionDurationMinutes,
           },

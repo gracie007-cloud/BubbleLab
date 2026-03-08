@@ -1,6 +1,20 @@
 import type { MessageContent } from '@langchain/core/messages';
-import { parseJsonWithFallbacks } from './json-parsing';
+import { parseJsonWithFallbacks } from './json-parsing.js';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
+
+/**
+ * Detect garbage/empty responses from models after heavy tool use.
+ * Returns true if the content is empty or matches common garbage patterns
+ * that models produce when they fail to synthesize a proper summary.
+ */
+export function isGarbageResponse(content: MessageContent): boolean {
+  if (!content) return true;
+  const text = typeof content === 'string' ? content : JSON.stringify(content);
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return true;
+  const garbagePatterns = ['[]', '{}', '""', "''", 'null', 'undefined'];
+  return garbagePatterns.includes(trimmed);
+}
 
 /**
  * Extract content from a generation's message.
@@ -297,6 +311,10 @@ export function formatFinalResponse(
       // Return the combined text (even if not JSON)
       return { response: combinedText };
     }
+
+    // Array had no extractable text (e.g. only tool_use/thinking blocks) —
+    // return empty string instead of raw JSON.stringify
+    return { response: '' };
   }
 
   console.log(

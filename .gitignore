@@ -166,4 +166,5 @@ dist/
 **/output/*.heic
 **/output/*.heif
 
-**/private_apps/** 
+**/private_apps/**
+.claude/

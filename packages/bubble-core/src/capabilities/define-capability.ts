@@ -20,6 +20,8 @@ export interface CapabilityRuntimeContext {
   credentials: Partial<Record<CredentialType, string>>;
   inputs: Record<string, string | number | boolean | string[]>;
   bubbleContext?: BubbleContext;
+  /** Free-text context from the capability config, injected into the subagent system prompt. */
+  context?: string;
 }
 
 /** A single capability tool function that accepts parsed parameters and returns a result. */
@@ -37,6 +39,11 @@ export type CapabilitySystemPromptFactory = (
   context: CapabilityRuntimeContext
 ) => string | Promise<string>;
 
+/** Factory that creates a delegation hint given a runtime context. */
+export type CapabilityDelegationHintFactory = (
+  context: CapabilityRuntimeContext
+) => string | Promise<string>;
+
 /** Factory that creates text to append to the agent's final response. */
 export type CapabilityResponseAppendFactory = (
   context: CapabilityRuntimeContext
@@ -47,6 +54,8 @@ export interface CapabilityDefinition {
   metadata: CapabilityMetadata;
   createTools: CapabilityToolFactory;
   createSystemPrompt?: CapabilitySystemPromptFactory;
+  /** Async factory that resolves a delegation hint at runtime (multi-cap mode). */
+  createDelegationHint?: CapabilityDelegationHintFactory;
   /** Called after the agent finishes — returned text is appended to the response. */
   createResponseAppend?: CapabilityResponseAppendFactory;
   hooks?: {
@@ -72,6 +81,10 @@ export interface DefineCapabilityOptions {
     schema: z.ZodObject<z.ZodRawShape>;
     /** Bubble names used internally by this tool (e.g., ['google-drive']). */
     internalBubbles?: BubbleName[];
+    /** Whether this tool requires human approval before execution. */
+    requiresApproval?: boolean;
+    /** Expose this tool directly on the master agent in multi-capability delegation mode. */
+    masterTool?: boolean;
     func: (ctx: CapabilityRuntimeContext) => CapabilityToolFunc;
   }>;
   systemPrompt?: string | CapabilitySystemPromptFactory;
@@ -81,7 +94,7 @@ export interface DefineCapabilityOptions {
   /** Optional model config overrides applied at runtime (e.g., force a specific model or raise maxTokens). */
   modelConfigOverride?: CapabilityModelConfigOverride;
   /** Short guidance for the main agent on when to delegate to this capability in multi-capability mode. */
-  delegationHint?: string;
+  delegationHint?: string | CapabilityDelegationHintFactory;
   /** Hidden capabilities are registered for runtime use but not shown in the UI. */
   hidden?: boolean;
   /** Data-driven provider options for the wizard "Choose Providers" step. */
@@ -104,6 +117,10 @@ export function defineCapability(
       $refStrategy: 'none',
     }) as Record<string, unknown>,
     ...(tool.internalBubbles ? { internalBubbles: tool.internalBubbles } : {}),
+    ...(tool.requiresApproval
+      ? { requiresApproval: tool.requiresApproval }
+      : {}),
+    ...(tool.masterTool ? { masterTool: tool.masterTool } : {}),
   }));
 
   // Build serializable metadata
@@ -123,7 +140,10 @@ export function defineCapability(
         ? options.systemPrompt
         : undefined,
     modelConfigOverride: options.modelConfigOverride,
-    delegationHint: options.delegationHint,
+    delegationHint:
+      typeof options.delegationHint === 'string'
+        ? options.delegationHint
+        : undefined,
     hidden: options.hidden,
     providers: options.providers,
   };
@@ -143,6 +163,12 @@ export function defineCapability(
       ? options.systemPrompt
       : undefined;
 
+  // Build delegation hint factory
+  const createDelegationHint: CapabilityDelegationHintFactory | undefined =
+    typeof options.delegationHint === 'function'
+      ? options.delegationHint
+      : undefined;
+
   // Build response append factory
   const createResponseAppend: CapabilityResponseAppendFactory | undefined =
     typeof options.responseAppend === 'function'
@@ -155,6 +181,7 @@ export function defineCapability(
     metadata,
     createTools,
     createSystemPrompt,
+    createDelegationHint,
     createResponseAppend,
     hooks: options.hooks,
   };

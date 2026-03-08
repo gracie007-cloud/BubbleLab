@@ -15,3 +15,6 @@ echo "✅ Lockfile is up to date"
 # Run lint-staged for staged files
 echo "🧹 Running lint-staged..."
 npx lint-staged
+
+echo "✅ Pre-commit checks passed"
+echo "💡 Typecheck will run in commit-workflow.sh"

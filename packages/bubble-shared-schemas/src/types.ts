@@ -26,6 +26,7 @@ export enum CredentialType {
   CLOUDFLARE_R2_ACCESS_KEY = 'CLOUDFLARE_R2_ACCESS_KEY',
   CLOUDFLARE_R2_SECRET_KEY = 'CLOUDFLARE_R2_SECRET_KEY',
   CLOUDFLARE_R2_ACCOUNT_ID = 'CLOUDFLARE_R2_ACCOUNT_ID',
+  S3_CRED = 'S3_CRED',
   // Scraping Credentials
   APIFY_CRED = 'APIFY_CRED',
 
@@ -61,6 +62,7 @@ export enum CredentialType {
   // Browser Session Credentials (BrowserBase-powered)
   AMAZON_CRED = 'AMAZON_CRED',
   LINKEDIN_CRED = 'LINKEDIN_CRED',
+  BROWSERBASE_CRED = 'BROWSERBASE_CRED', // Usage tracking for BrowserBase browser minutes
   // Crustdata Credentials
   CRUSTDATA_API_KEY = 'CRUSTDATA_API_KEY',
 
@@ -78,6 +80,33 @@ export enum CredentialType {
 
   // Confluence Credentials
   CONFLUENCE_CRED = 'CONFLUENCE_CRED',
+
+  // PostHog Credentials
+  POSTHOG_API_KEY = 'POSTHOG_API_KEY',
+
+  // SendSafely Credentials
+  SENDSAFELY_CRED = 'SENDSAFELY_CRED',
+
+  // Linear Credentials
+  LINEAR_CRED = 'LINEAR_CRED',
+
+  // Attio Credentials
+  ATTIO_CRED = 'ATTIO_CRED',
+
+  // HubSpot Credentials
+  HUBSPOT_CRED = 'HUBSPOT_CRED',
+
+  // Sortly Credentials
+  SORTLY_API_KEY = 'SORTLY_API_KEY',
+
+  // Assembled Credentials
+  ASSEMBLED_CRED = 'ASSEMBLED_CRED',
+
+  // Xero Credentials
+  XERO_CRED = 'XERO_CRED',
+
+  // Ramp Credentials
+  RAMP_CRED = 'RAMP_CRED',
 }
 
 // Define all bubble names as a union type for type safety
@@ -113,6 +142,7 @@ export type BubbleName =
   | 'bubbleflow-validation-tool'
   | 'code-edit-tool'
   | 'storage'
+  | 's3-storage'
   | 'google-drive'
   | 'gmail'
   | 'google-sheets'
@@ -142,6 +172,17 @@ export type BubbleName =
   | 'ashby'
   | 'fullenrich'
   | 'linkedin-connection-tool'
+  | 'linkedin-sent-invitations-tool'
+  | 'linkedin-received-invitations-tool'
+  | 'linkedin-accept-invitations-tool'
   | 'stripe'
   | 'confluence'
-  | 'yc-scraper-tool';
+  | 'sendsafely'
+  | 'yc-scraper-tool'
+  | 'posthog'
+  | 'linear'
+  | 'attio'
+  | 'hubspot'
+  | 'assembled'
+  | 'xero'
+  | 'ramp';

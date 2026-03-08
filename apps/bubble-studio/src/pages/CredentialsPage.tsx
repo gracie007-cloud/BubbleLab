@@ -88,6 +88,7 @@ const getServiceNameForCredentialType = (
     [CredentialType.INSFORGE_API_KEY]: 'InsForge',
     [CredentialType.CUSTOM_AUTH_KEY]: 'Custom',
     [CredentialType.AMAZON_CRED]: 'Amazon',
+    [CredentialType.BROWSERBASE_CRED]: 'BrowserBase',
     [CredentialType.CRUSTDATA_API_KEY]: 'Crustdata',
     [CredentialType.JIRA_CRED]: 'Jira',
     [CredentialType.ASHBY_CRED]: 'Ashby',
@@ -96,6 +97,16 @@ const getServiceNameForCredentialType = (
     [CredentialType.STRIPE_CRED]: 'Stripe',
     [CredentialType.CREDENTIAL_WILDCARD]: 'Wiki',
     [CredentialType.CONFLUENCE_CRED]: 'Confluence',
+    [CredentialType.POSTHOG_API_KEY]: 'PostHog',
+    [CredentialType.SENDSAFELY_CRED]: 'SendSafely',
+    [CredentialType.S3_CRED]: 'Amazon S3',
+    [CredentialType.LINEAR_CRED]: 'Linear',
+    [CredentialType.ATTIO_CRED]: 'Attio',
+    [CredentialType.HUBSPOT_CRED]: 'HubSpot',
+    [CredentialType.SORTLY_API_KEY]: 'Sortly',
+    [CredentialType.ASSEMBLED_CRED]: 'Assembled',
+    [CredentialType.XERO_CRED]: 'Xero',
+    [CredentialType.RAMP_CRED]: 'Ramp',
   };
 
   return typeToServiceMap[credentialType] || credentialType;

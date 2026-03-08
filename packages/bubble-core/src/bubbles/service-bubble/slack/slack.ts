@@ -1,8 +1,12 @@
 import { z } from 'zod';
 import { ServiceBubble } from '../../../types/service-bubble-class.js';
 import type { BubbleContext } from '../../../types/bubble.js';
-import { CredentialType } from '@bubblelab/shared-schemas';
-import { markdownToBlocks, containsMarkdown } from './slack.utils.js';
+import { CredentialType, type ExecutionMeta } from '@bubblelab/shared-schemas';
+import {
+  markdownToBlocks,
+  containsMarkdown,
+  splitBlocksByTable,
+} from './slack.utils.js';
 
 // Slack API base URL
 const SLACK_API_BASE = 'https://slack.com/api';
@@ -107,13 +111,13 @@ const SlackParamsSchema = z.discriminatedUnion('operation', [
     operation: z
       .literal('send_message')
       .describe(
-        'Send a message to a Slack channel or DM. Required scopes: chat:write (add chat:write.public for public channels bot has not joined, add im:write to send DMs to users)'
+        'Send a message to a Slack channel or DM. Required scopes: chat:write, chat:write.public (public channels bot has not joined), im:write (DMs to users). If a scope is missing, ask a workspace admin to reinstall the Bubble Lab Slack app with the required permissions, then contact the Bubble Lab team to relink your credential.'
       ),
     channel: z
       .string()
       .min(1, 'Channel ID or name is required')
       .describe(
-        'Channel ID (e.g., C1234567890), channel name (e.g., general or #general), or user ID for DM (e.g., U1234567890 - requires im:write scope)'
+        'Channel ID (e.g., C1234567890), channel name (e.g., general or #general), or user ID for DM (e.g., U1234567890)'
       ),
     text: z
       .string()
@@ -1333,6 +1337,7 @@ export type SlackOperationResult<T extends SlackParams['operation']> = Extract<
 interface SlackApiError {
   ok: false;
   error: string;
+  errors?: string[];
   response_metadata?: {
     warnings?: string[];
     messages?: string[];
@@ -1354,10 +1359,11 @@ export class SlackBubble<
   public async testCredential(): Promise<boolean> {
     // Make a test API call to the Slack API
     const response = await this.makeSlackApiCall('auth.test', {});
-    if (response.ok) {
-      return true;
+    if (!response.ok) {
+      const errorResponse = response as unknown as { error?: string };
+      throw new Error(errorResponse.error || 'Slack auth test failed');
     }
-    return false;
+    return true;
   }
   static readonly type = 'service' as const;
   static readonly service = 'slack';
@@ -1385,16 +1391,13 @@ Comprehensive Slack integration for messaging and workspace management.
   protected async performAction(
     context?: BubbleContext
   ): Promise<Extract<SlackResult, { operation: T['operation'] }>> {
-    // Context is available but not currently used in this implementation
-    void context;
-
     const { operation } = this.params;
 
     try {
       const result = await (async (): Promise<SlackResult> => {
         switch (operation) {
           case 'send_message':
-            return await this.sendMessage(this.params);
+            return await this.sendMessage(this.params, context);
           case 'list_channels':
             return await this.listChannels(this.params);
           case 'get_channel_info':
@@ -1502,8 +1505,52 @@ Comprehensive Slack integration for messaging and workspace management.
   // Slack's maximum blocks per message
   private static readonly MAX_BLOCKS_PER_MESSAGE = 50;
 
+  /**
+   * Build "Powered by BubbleLab" footer blocks from execution metadata.
+   * Returns empty array if no metadata is available.
+   */
+  private static buildFooterBlocks(
+    executionMeta?: ExecutionMeta
+  ): Record<string, unknown>[] {
+    if (!executionMeta?.studioBaseUrl || !executionMeta?.flowId) {
+      return [];
+    }
+    const viewUrl = `${executionMeta.studioBaseUrl}/flow/${executionMeta.flowId}`;
+    const traceUrl = executionMeta.executionId
+      ? `${executionMeta.studioBaseUrl}/traces/${executionMeta.flowId}/${executionMeta.executionId}`
+      : null;
+    const traceSuffix = traceUrl ? ` · <${traceUrl}|View Traces>` : '';
+    const firstName = executionMeta._ownerFirstName || '';
+
+    const pearlFlowId = executionMeta._pearlFlowId;
+    const pearlUrl = pearlFlowId
+      ? `${executionMeta.studioBaseUrl}/flow/${pearlFlowId}`
+      : undefined;
+
+    const pearlLabel = firstName ? `${firstName}'s Pearl` : 'Pearl';
+
+    let text: string;
+    if (executionMeta._isPearlFlow) {
+      text = `<${viewUrl}|${pearlLabel}>${traceSuffix}`;
+    } else if (pearlUrl) {
+      const flowName = executionMeta._flowName || 'Flow';
+      text = `<${pearlUrl}|${pearlLabel}> · <${viewUrl}|${flowName}>${traceSuffix}`;
+    } else {
+      text = `Powered by Bubble Lab · <${viewUrl}|View Flow>${traceSuffix}`;
+    }
+
+    return [
+      { type: 'divider' },
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text }],
+      },
+    ];
+  }
+
   private async sendMessage(
-    params: Extract<SlackParams, { operation: 'send_message' }>
+    params: Extract<SlackParams, { operation: 'send_message' }>,
+    context?: BubbleContext
   ): Promise<Extract<SlackResult, { operation: 'send_message' }>> {
     const {
       channel,
@@ -1513,11 +1560,11 @@ Comprehensive Slack integration for messaging and workspace management.
       icon_url,
       attachments,
       blocks,
-      thread_ts,
       reply_broadcast,
       unfurl_links,
       unfurl_media,
     } = params;
+    let { thread_ts } = params;
 
     // Resolve channel name to ID if needed
     const resolvedChannel = await this.resolveChannelId(channel);
@@ -1531,6 +1578,68 @@ Comprehensive Slack integration for messaging and workspace management.
       finalBlocks = markdownToBlocks(text) as unknown as typeof blocks;
       // Keep text as fallback for notifications/previews
       finalText = text;
+    }
+
+    // Build "Powered by BubbleLab" footer from execution metadata
+    const executionMeta = context?.executionMeta;
+    const footerBlocks = SlackBubble.buildFooterBlocks(executionMeta);
+
+    // Check if we should replace a thinking placeholder message
+    const thinkingTs = executionMeta?._thinkingMessageTs;
+    const thinkingChannel = executionMeta?._thinkingMessageChannel;
+    const shouldReplaceThinking =
+      thinkingTs && thinkingChannel && resolvedChannel === thinkingChannel;
+
+    // Delete the thinking placeholder and post a fresh message instead of
+    // using chat.update, which has a stricter payload size limit and fails
+    // with msg_too_long on messages that chat.postMessage handles fine.
+    if (shouldReplaceThinking && executionMeta) {
+      delete executionMeta._thinkingMessageTs;
+      delete executionMeta._thinkingMessageChannel;
+
+      // Preserve thread context so the new message appears in the same thread
+      if (!thread_ts && thinkingTs) {
+        thread_ts = thinkingTs;
+      }
+
+      // Fire-and-forget delete of the placeholder
+      this.makeSlackApiCall('chat.delete', {
+        channel: resolvedChannel,
+        ts: thinkingTs,
+      }).catch(() => {
+        // Best-effort: if delete fails (e.g. permissions), the new message
+        // still posts and the placeholder becomes stale but harmless.
+      });
+    }
+
+    // Slack only allows one table block per message.
+    // If there are multiple tables, split into separate messages.
+    if (finalBlocks) {
+      const tableChunks = splitBlocksByTable(
+        finalBlocks as unknown as import('./slack.utils.js').SlackBlock[]
+      );
+      if (tableChunks.length > 1) {
+        // Flatten chunks back into a single array but keep the chunk
+        // boundaries aligned so sendMessageWithBlockChunks sends each
+        // chunk as its own message (each with at most 1 table block).
+        return await this.sendMessageWithBlockChunks(
+          resolvedChannel,
+          finalText,
+          finalBlocks,
+          {
+            username,
+            icon_emoji,
+            icon_url,
+            attachments,
+            thread_ts,
+            reply_broadcast,
+            unfurl_links,
+            unfurl_media,
+          },
+          footerBlocks,
+          tableChunks as unknown as (typeof finalBlocks)[]
+        );
+      }
     }
 
     // If we have more than 50 blocks, split into multiple messages
@@ -1551,8 +1660,26 @@ Comprehensive Slack integration for messaging and workspace management.
           reply_broadcast,
           unfurl_links,
           unfurl_media,
-        }
+        },
+        footerBlocks
       );
+    }
+
+    // Append footer blocks to the message
+    if (footerBlocks.length > 0) {
+      if (finalBlocks) {
+        // Append footer to existing blocks
+        finalBlocks = [...finalBlocks, ...footerBlocks] as typeof finalBlocks;
+      } else if (finalText) {
+        // Plain text message — convert to section block + footer
+        finalBlocks = [
+          {
+            type: 'section',
+            text: { type: 'mrkdwn', text: finalText },
+          },
+          ...footerBlocks,
+        ] as unknown as typeof blocks;
+      }
     }
 
     const body: Record<string, unknown> = {
@@ -1572,7 +1699,41 @@ Comprehensive Slack integration for messaging and workspace management.
       body.reply_broadcast = reply_broadcast;
     }
 
-    const response = await this.makeSlackApiCall('chat.postMessage', body);
+    let response = await this.makeSlackApiCall('chat.postMessage', body);
+
+    // If Slack rejects the message because it can't download an image,
+    // strip only the broken image blocks (by index from the error) and retry
+    // so valid images and the rest of the message still get delivered.
+    if (
+      !response.ok &&
+      response.error === 'invalid_blocks' &&
+      Array.isArray(response.errors) &&
+      body.blocks
+    ) {
+      const imageErrors = (response.errors as string[]).filter(
+        (e) => typeof e === 'string' && e.includes('downloading image failed')
+      );
+      if (imageErrors.length > 0) {
+        // Extract broken block indices from json-pointer paths like
+        // "downloading image failed [json-pointer:/blocks/8/image_url]"
+        const brokenIndices = new Set<number>();
+        for (const err of imageErrors) {
+          const match = err.match(/\/blocks\/(\d+)\//);
+          if (match) brokenIndices.add(Number(match[1]));
+        }
+
+        const blocks = body.blocks as Array<Record<string, unknown>>;
+        const filtered =
+          brokenIndices.size > 0
+            ? blocks.filter((_, i) => !brokenIndices.has(i))
+            : blocks.filter((b) => b.type !== 'image'); // fallback: strip all images
+
+        if (filtered.length > 0 && filtered.length < blocks.length) {
+          body.blocks = filtered;
+          response = await this.makeSlackApiCall('chat.postMessage', body);
+        }
+      }
+    }
 
     return {
       operation: 'send_message',
@@ -1589,8 +1750,9 @@ Comprehensive Slack integration for messaging and workspace management.
   }
 
   /**
-   * Sends a message with blocks split into multiple messages when exceeding Slack's 50 block limit.
-   * Subsequent chunks are sent as thread replies to the first message.
+   * Sends a message with blocks split into multiple messages.
+   * Used when exceeding Slack's 50 block limit or when multiple table blocks
+   * need separate messages. Subsequent chunks are sent as thread replies.
    */
   private async sendMessageWithBlockChunks(
     channel: string,
@@ -1610,16 +1772,25 @@ Comprehensive Slack integration for messaging and workspace management.
       reply_broadcast?: boolean;
       unfurl_links?: boolean;
       unfurl_media?: boolean;
-    }
+    },
+    footerBlocks: Record<string, unknown>[] = [],
+    preSplitChunks?: (typeof blocks)[]
   ): Promise<Extract<SlackResult, { operation: 'send_message' }>> {
-    // Split blocks into chunks of 50
-    const blockChunks: (typeof blocks)[] = [];
-    for (
-      let i = 0;
-      i < blocks.length;
-      i += SlackBubble.MAX_BLOCKS_PER_MESSAGE
-    ) {
-      blockChunks.push(blocks.slice(i, i + SlackBubble.MAX_BLOCKS_PER_MESSAGE));
+    // Use pre-split chunks (e.g. from multi-table splitting) or split by size
+    let blockChunks: (typeof blocks)[];
+    if (preSplitChunks) {
+      blockChunks = preSplitChunks;
+    } else {
+      blockChunks = [];
+      for (
+        let i = 0;
+        i < blocks.length;
+        i += SlackBubble.MAX_BLOCKS_PER_MESSAGE
+      ) {
+        blockChunks.push(
+          blocks.slice(i, i + SlackBubble.MAX_BLOCKS_PER_MESSAGE)
+        );
+      }
     }
 
     let firstMessageTs: string | undefined;
@@ -1630,7 +1801,12 @@ Comprehensive Slack integration for messaging and workspace management.
     const errors: string[] = [];
 
     for (let chunkIndex = 0; chunkIndex < blockChunks.length; chunkIndex++) {
-      const chunk = blockChunks[chunkIndex];
+      const isLastChunk = chunkIndex === blockChunks.length - 1;
+      // Append footer blocks to the last chunk
+      const chunk =
+        isLastChunk && footerBlocks.length > 0
+          ? ([...blockChunks[chunkIndex], ...footerBlocks] as typeof blocks)
+          : blockChunks[chunkIndex];
       const isFirstChunk = chunkIndex === 0;
 
       const body: Record<string, unknown> = {
@@ -2489,7 +2665,9 @@ Comprehensive Slack integration for messaging and workspace management.
     if (!response.ok) {
       throw new Error(
         `Failed to open DM with user ${userId}: ${response.error}. ` +
-          `Make sure you have the 'im:write' scope enabled in your Slack app.`
+          `This is likely a missing Slack scope. ` +
+          `Ask a workspace administrator to reinstall the Bubble Lab Slack app with the required permissions, ` +
+          `then contact the Bubble Lab team to relink your credential.`
       );
     }
 

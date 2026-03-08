@@ -17,6 +17,18 @@ export const CDPCookieSchema = z.object({
 export type CDPCookie = z.infer<typeof CDPCookieSchema>;
 
 /**
+ * Embedded proxy config in browser session credential payload
+ * Backward compatible: old credentials omit proxy entirely
+ */
+export const BrowserSessionProxySchema = z
+  .object({
+    server: z.string(),
+    username: z.string().optional(),
+    password: z.string().optional(),
+  })
+  .optional();
+
+/**
  * Browser session data returned from credential injection
  * This is what gets decrypted from AMAZON_CRED or similar browser session credentials
  */
@@ -25,6 +37,7 @@ export const BrowserSessionDataSchema = z.object({
     .string()
     .describe('BrowserBase context ID for session persistence'),
   cookies: z.array(CDPCookieSchema).describe('Array of cookies to inject'),
+  proxy: BrowserSessionProxySchema,
 });
 
 export type BrowserSessionData = z.infer<typeof BrowserSessionDataSchema>;
@@ -165,6 +178,15 @@ export const BrowserBaseParamsSchema = z.discriminatedUnion('operation', [
     stealth: StealthConfigSchema.optional().describe(
       'Stealth mode configuration for anti-bot avoidance and CAPTCHA solving'
     ),
+    // Session timeout (BrowserBase: 60-21600 seconds)
+    timeout_seconds: z
+      .number()
+      .min(60)
+      .max(21600)
+      .optional()
+      .describe(
+        'Session timeout in seconds. Duration after which the session automatically ends (60-21600).'
+      ),
   }),
 
   // Navigate operation - navigate to a URL
@@ -228,6 +250,29 @@ export const BrowserBaseParamsSchema = z.discriminatedUnion('operation', [
       .optional()
       .default(0)
       .describe('Delay between keystrokes in milliseconds'),
+    credentials: z
+      .record(z.nativeEnum(CredentialType), z.string())
+      .optional()
+      .describe('Object mapping credential types to values'),
+  }),
+
+  // Select operation - select an option in a <select> element
+  z.object({
+    operation: z
+      .literal('select')
+      .describe('Select an option in a dropdown/select element'),
+    session_id: z.string().min(1).describe('Active browser session ID'),
+    selector: z
+      .string()
+      .min(1)
+      .describe('CSS selector of the <select> element'),
+    value: z.string().describe('Value of the option to select'),
+    timeout: z
+      .number()
+      .min(1000)
+      .optional()
+      .default(5000)
+      .describe('Element wait timeout in milliseconds'),
     credentials: z
       .record(z.nativeEnum(CredentialType), z.string())
       .optional()
@@ -389,6 +434,13 @@ export const BrowserBaseResultSchema = z.discriminatedUnion('operation', [
   // Type result
   z.object({
     operation: z.literal('type'),
+    success: z.boolean().describe('Whether the operation was successful'),
+    error: z.string().describe('Error message if operation failed'),
+  }),
+
+  // Select result
+  z.object({
+    operation: z.literal('select'),
     success: z.boolean().describe('Whether the operation was successful'),
     error: z.string().describe('Error message if operation failed'),
   }),

@@ -161,6 +161,8 @@ export class BubbleFactory {
       'insforge-db',
       'amazon-shopping-tool',
       'linkedin-connection-tool',
+      'linkedin-sent-invitations-tool',
+      'linkedin-received-invitations-tool',
       'company-enrichment-tool',
       'people-search-tool',
       'jira',
@@ -168,7 +170,16 @@ export class BubbleFactory {
       'ashby',
       'fullenrich',
       'stripe',
+      'sendsafely',
       'yc-scraper-tool',
+      'posthog',
+      'linear',
+      'attio',
+      'hubspot',
+      's3-storage',
+      'assembled',
+      'xero',
+      'ramp',
     ];
   }
 
@@ -370,14 +381,42 @@ export class BubbleFactory {
     const { FullEnrichBubble } = await import(
       './bubbles/service-bubble/fullenrich/index.js'
     );
-    const { LinkedInConnectionTool } = await import(
-      './bubbles/tool-bubble/linkedin-connection-tool/index.js'
-    );
+    const {
+      LinkedInConnectionTool,
+      LinkedInSentInvitationsTool,
+      LinkedInReceivedInvitationsTool,
+      LinkedInAcceptInvitationsTool,
+    } = await import('./bubbles/tool-bubble/browser-tools/index.js');
     const { StripeBubble } = await import(
       './bubbles/service-bubble/stripe/index.js'
     );
+    const { SendSafelyBubble } = await import(
+      './bubbles/service-bubble/sendsafely/index.js'
+    );
     const { YCScraperTool } = await import(
       './bubbles/tool-bubble/yc-scraper-tool.js'
+    );
+    const { PosthogBubble } = await import(
+      './bubbles/service-bubble/posthog/index.js'
+    );
+    const { LinearBubble } = await import(
+      './bubbles/service-bubble/linear/index.js'
+    );
+    const { AttioBubble } = await import(
+      './bubbles/service-bubble/attio/index.js'
+    );
+    const { HubSpotBubble } = await import(
+      './bubbles/service-bubble/hubspot/index.js'
+    );
+    const { S3Bubble } = await import('./bubbles/service-bubble/s3/index.js');
+    const { AssembledBubble } = await import(
+      './bubbles/service-bubble/assembled/index.js'
+    );
+    const { XeroBubble } = await import(
+      './bubbles/service-bubble/xero/index.js'
+    );
+    const { RampBubble } = await import(
+      './bubbles/service-bubble/ramp/index.js'
     );
 
     // Create the default factory instance
@@ -516,10 +555,31 @@ export class BubbleFactory {
     this.register('fullenrich', FullEnrichBubble as BubbleClassWithMetadata);
     this.register(
       'linkedin-connection-tool',
-      LinkedInConnectionTool as BubbleClassWithMetadata
+      LinkedInConnectionTool as unknown as BubbleClassWithMetadata
+    );
+    this.register(
+      'linkedin-sent-invitations-tool',
+      LinkedInSentInvitationsTool as unknown as BubbleClassWithMetadata
+    );
+    this.register(
+      'linkedin-received-invitations-tool',
+      LinkedInReceivedInvitationsTool as unknown as BubbleClassWithMetadata
+    );
+    this.register(
+      'linkedin-accept-invitations-tool',
+      LinkedInAcceptInvitationsTool as unknown as BubbleClassWithMetadata
     );
     this.register('stripe', StripeBubble as BubbleClassWithMetadata);
+    this.register('sendsafely', SendSafelyBubble as BubbleClassWithMetadata);
     this.register('yc-scraper-tool', YCScraperTool as BubbleClassWithMetadata);
+    this.register('posthog', PosthogBubble as BubbleClassWithMetadata);
+    this.register('linear', LinearBubble as BubbleClassWithMetadata);
+    this.register('attio', AttioBubble as BubbleClassWithMetadata);
+    this.register('hubspot', HubSpotBubble as BubbleClassWithMetadata);
+    this.register('s3-storage', S3Bubble as BubbleClassWithMetadata);
+    this.register('assembled', AssembledBubble as BubbleClassWithMetadata);
+    this.register('xero', XeroBubble as BubbleClassWithMetadata);
+    this.register('ramp', RampBubble as BubbleClassWithMetadata);
 
     // After all default bubbles are registered, auto-populate bubbleDependencies
     if (!BubbleFactory.dependenciesPopulated) {
@@ -818,6 +878,14 @@ import {
   AshbyBubble, // bubble name: 'ashby'
   FullEnrichBubble, // bubble name: 'fullenrich'
   StripeBubble, // bubble name: 'stripe'
+  SendSafelyBubble, // bubble name: 'sendsafely'
+  PosthogBubble, // bubble name: 'posthog'
+  LinearBubble, // bubble name: 'linear'
+  AttioBubble, // bubble name: 'attio'
+  HubSpotBubble, // bubble name: 'hubspot'
+  S3Bubble, // bubble name: 's3-storage'
+  AssembledBubble, // bubble name: 'assembled'
+  RampBubble, // bubble name: 'ramp'
 
   // Tool Bubbles (Perform useful actions)
   ResearchAgentTool, // bubble name: 'research-agent-tool'
@@ -833,6 +901,9 @@ import {
   YouTubeTool, // bubble name: 'youtube-tool'
   AmazonShoppingTool, // bubble name: 'amazon-shopping-tool',
   LinkedInConnectionTool, // bubble name: 'linkedin-connection-tool'
+  LinkedInSentInvitationsTool, // bubble name: 'linkedin-sent-invitations-tool'
+  LinkedInReceivedInvitationsTool, // bubble name: 'linkedin-received-invitations-tool'
+  LinkedInAcceptInvitationsTool, // bubble name: 'linkedin-accept-invitations-tool'
   PeopleSearchTool, // bubble name: 'people-search-tool'
   YCScraperTool, // bubble name: 'yc-scraper-tool'
 
@@ -853,8 +924,18 @@ export interface Output {
 
 export class ${className} extends BubbleFlow<'webhook/http'> {
   async handle(payload: WebhookEvent): Promise<Output> {
-    // Your workflow logic here
-    // Use get-bubble-details-tool to learn about available bubbles
+    // Example: instantiate a bubble and call .action() to execute it
+    // const calendar = new GoogleCalendarBubble({
+    //   operation: 'list_events',
+    //   calendar_id: 'primary',
+    //   time_min: '2025-01-01T00:00:00Z',
+    //   time_max: '2025-12-31T23:59:59Z',
+    // });
+    // const result = await calendar.action();
+    // if (!result.success) throw new Error(result.error);
+    // const events = result.data?.events || [];
+
+    // Use get-bubble to learn about each bubble's parameters and operations
     return { message: 'Hello from BubbleFlow!' };
   }
 }

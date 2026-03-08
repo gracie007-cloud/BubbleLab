@@ -12,24 +12,30 @@ import { ChatAnthropic } from '@langchain/anthropic';
 import {
   HumanMessage,
   AIMessage,
+  SystemMessage,
   ToolMessage,
   AIMessageChunk,
 } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { DynamicStructuredTool } from '@langchain/core/tools';
-import { AvailableModels } from '@bubblelab/shared-schemas';
+import {
+  AvailableModels,
+  type AvailableModel,
+} from '@bubblelab/shared-schemas';
 import {
   AvailableTools,
   type AvailableTool,
 } from '../../types/available-tools.js';
 import { BubbleFactory } from '../../bubble-factory.js';
 import type { BubbleName, BubbleResult } from '@bubblelab/shared-schemas';
+import type { CapabilityInput } from '@bubblelab/shared-schemas';
 import type { StreamingEvent } from '@bubblelab/shared-schemas';
 import { ConversationMessageSchema } from '@bubblelab/shared-schemas';
 import {
   extractAndStreamThinkingTokens,
   formatFinalResponse,
   generationsToMessageContent,
+  isGarbageResponse,
 } from '../../utils/agent-formatter.js';
 import { isAIMessage, isAIMessageChunk } from '@langchain/core/messages';
 import { HarmBlockThreshold, HarmCategory } from '@google/generative-ai';
@@ -42,13 +48,17 @@ import {
   getCapability,
   type CapabilityRuntimeContext,
 } from '../../capabilities/index.js';
-
+import {
+  applyCapabilityPostprocessing,
+  applyCapabilityPreprocessing,
+} from './capability-pipeline.js';
 // Define tool hook context - provides access to messages and tool call details
 export type ToolHookContext = {
   toolName: AvailableTool;
   toolInput: unknown;
   toolOutput?: BubbleResult<unknown>; // Only available in afterToolCall
   messages: BaseMessage[];
+  bubbleContext?: BubbleContext; // Access to executionMeta, variableId, etc.
 };
 
 // Tool hooks can modify the entire messages array (including system prompt)
@@ -56,9 +66,12 @@ export type ToolHookAfter = (
   context: ToolHookContext
 ) => Promise<{ messages: BaseMessage[]; shouldStop?: boolean }>;
 
-export type ToolHookBefore = (
-  context: ToolHookContext
-) => Promise<{ messages: BaseMessage[]; toolInput: Record<string, any> }>;
+export type ToolHookBefore = (context: ToolHookContext) => Promise<{
+  messages: BaseMessage[];
+  toolInput: Record<string, any>;
+  shouldSkip?: boolean;
+  skipMessage?: string;
+}>;
 
 // Context for afterLLMCall hook - provides access to messages and the last AI response
 export type AfterLLMCallContext = {
@@ -273,6 +286,12 @@ const CapabilityConfigSchema = z.object({
     .default({})
     .optional()
     .describe('Capability-specific credentials (injected at runtime)'),
+  context: z
+    .string()
+    .optional()
+    .describe(
+      'Free-text context injected into this capability subagent system prompt (e.g., workspace-specific details, naming conventions, project prefixes)'
+    ),
 });
 
 // Define the parameters schema for the AI Agent bubble
@@ -317,7 +336,7 @@ const AIAgentParamsSchema = z.object({
     .array(ToolConfigSchema)
     .default([])
     .describe(
-      'Array of pre-registered tools the AI agent can use. Can be tool types (web-search-tool, web-scrape-tool, web-crawl-tool, web-extract-tool, instagram-tool). If using image models, set the tools to []'
+      'Array of tool config objects: [{ name: "web-search-tool" }, { name: "web-scrape-tool" }]. Each object requires a "name" field. Available tool names: web-search-tool, web-scrape-tool, web-crawl-tool, web-extract-tool, instagram-tool. If using image models, set tools to []'
     ),
   customTools: z
     .array(CustomToolSchema)
@@ -356,6 +375,18 @@ const AIAgentParamsSchema = z.object({
   expectedOutputSchema: ExpectedOutputSchema.optional().describe(
     'Zod schema or JSON schema string that defines the expected structure of the AI response. When provided, automatically enables JSON mode and instructs the AI to output in the exact format. Example: z.object({ summary: z.string(), items: z.array(z.object({ name: z.string(), score: z.number() })) })'
   ),
+  memoryEnabled: z
+    .boolean()
+    .default(true)
+    .describe(
+      'Enable persistent memory across conversations. When true, the agent can recall and save information about people, topics, and events between conversations.'
+    ),
+  enableSlackHistory: z
+    .boolean()
+    .default(false)
+    .describe(
+      'Enable Slack thread history injection. When true, the agent receives full conversation history from Slack threads including user names, timezones, and images.'
+    ),
   // Note: beforeToolCall and afterToolCall are function hooks added via TypeScript interface
   // They cannot be part of the Zod schema but are available in the params
 });
@@ -398,7 +429,7 @@ const AIAgentResultSchema = z.object({
     .describe('Whether the agent execution completed successfully'),
 });
 
-type AIAgentParams = z.input<typeof AIAgentParamsSchema> & {
+export type AIAgentParams = z.input<typeof AIAgentParamsSchema> & {
   // Optional hooks for intercepting tool calls
   beforeToolCall?: ToolHookBefore;
   afterToolCall?: ToolHookAfter;
@@ -406,14 +437,33 @@ type AIAgentParams = z.input<typeof AIAgentParamsSchema> & {
   afterLLMCall?: AfterLLMCallHook;
   streamingCallback?: StreamingCallback;
 };
-type AIAgentParamsParsed = z.output<typeof AIAgentParamsSchema> & {
+export type AIAgentParamsParsed = z.output<typeof AIAgentParamsSchema> & {
   beforeToolCall?: ToolHookBefore;
   afterToolCall?: ToolHookAfter;
   afterLLMCall?: AfterLLMCallHook;
   streamingCallback?: StreamingCallback;
 };
 
-type AIAgentResult = z.output<typeof AIAgentResultSchema>;
+export type AIAgentResult = z.output<typeof AIAgentResultSchema>;
+
+function mergeCapabilityInputDefaults(
+  inputDefs: CapabilityInput[] | undefined,
+  userInputs: Record<string, string | number | boolean | string[]> | undefined
+): Record<string, string | number | boolean | string[]> {
+  const merged: Record<string, string | number | boolean | string[]> = {};
+  if (inputDefs) {
+    for (const def of inputDefs) {
+      if (def.default !== undefined) {
+        merged[def.name] = def.default;
+      }
+    }
+  }
+  // User values override defaults
+  if (userInputs) {
+    Object.assign(merged, userInputs);
+  }
+  return merged;
+}
 
 export class AIAgentBubble extends ServiceBubble<
   AIAgentParamsParsed,
@@ -440,10 +490,34 @@ export class AIAgentBubble extends ServiceBubble<
   private factory: BubbleFactory;
   private beforeToolCallHook: ToolHookBefore | undefined;
   private afterToolCallHook: ToolHookAfter | undefined;
+  /** Capability-scoped hooks: only fire for the capability's own tool names */
+  private capabilityBeforeHooks = new Map<string, ToolHookBefore>();
+  private capabilityAfterHooks = new Map<string, ToolHookAfter>();
   private afterLLMCallHook: AfterLLMCallHook | undefined;
   private streamingCallback: StreamingCallback | undefined;
   private shouldStopAfterTools = false;
   private shouldContinueToAgent = false;
+  private rescueAttempts = 0;
+  /** Current graph messages — kept in sync by executeToolsWithHooks so that
+   *  the use-capability tool can snapshot master state before delegation. */
+  private _currentGraphMessages: BaseMessage[] = [];
+
+  /** Emit a trace event via executionMeta._onTrace (if wired by the host). */
+  private _trace(
+    source: string,
+    message: string,
+    data?: Record<string, unknown>
+  ): void {
+    const onTrace = (
+      this.context?.executionMeta as Record<string, unknown> | undefined
+    )?._onTrace;
+    if (typeof onTrace === 'function') {
+      onTrace(source, message, data);
+    }
+  }
+  private static readonly MAX_RESCUE_ATTEMPTS = 1;
+  /** Max characters for a single tool result before truncation (~50k chars ≈ ~12k tokens). */
+  private static readonly MAX_TOOL_RESULT_CHARS = 50_000;
 
   constructor(
     params: AIAgentParams = {
@@ -467,10 +541,10 @@ export class AIAgentBubble extends ServiceBubble<
     const llm = this.initializeModel(this.params.model);
 
     const response = await llm.invoke(['Hello, how are you?']);
-    if (response.content) {
-      return true;
+    if (!response.content) {
+      throw new Error('Model returned empty response');
     }
-    return false;
+    return true;
   }
 
   /**
@@ -527,14 +601,25 @@ export class AIAgentBubble extends ServiceBubble<
       images,
       maxIterations,
       modelConfig,
-      conversationHistory
+      conversationHistory,
+      agentTools
     );
   }
 
   /**
    * Modify params before execution - centralizes all param transformations
    */
-  private async beforeAction(): Promise<void> {
+  protected override async beforeAction(): Promise<void> {
+    // Deduplicate capabilities by id — keep the first occurrence of each
+    if (this.params.capabilities && this.params.capabilities.length > 1) {
+      const seen = new Set<string>();
+      this.params.capabilities = this.params.capabilities.filter((c) => {
+        if (seen.has(c.id)) return false;
+        seen.add(c.id);
+        return true;
+      });
+    }
+
     // Enforce minimum maxTokens of 10000
     if (
       this.params.model.maxTokens === undefined ||
@@ -565,105 +650,231 @@ export class AIAgentBubble extends ServiceBubble<
       timeZone: 'UTC',
       timeZoneName: 'short',
     });
-    this.params.systemPrompt = `${this.params.systemPrompt}\n\nCurrent time: ${now}`;
+    this.params.systemPrompt = `${this.params.systemPrompt}\n\n**System time (UTC):** ${now}\nIMPORTANT: The system time above is in UTC. Always interpret and present times from the user's perspective and timezone. If the user's timezone is known (from conversation history, user profile, or context), convert all times accordingly. If unknown, ask the user for their timezone before making time-sensitive decisions.`;
 
-    // Apply capability model config overrides
-    const caps = this.params.capabilities ?? [];
-    if (caps.length > 1) {
-      // Multi-capability delegator: use Gemini 3 Pro for reliable tool-calling / routing.
-      // Sub-agents apply their own modelConfigOverride in single-cap mode.
-      this.params.model.model =
-        RECOMMENDED_MODELS.BEST as typeof this.params.model.model;
-      this.params.model.reasoningEffort = undefined;
-    } else {
-      // Single-cap: apply that capability's model override directly
-      for (const capConfig of caps) {
-        const capDef = getCapability(capConfig.id);
-        const override = capDef?.metadata.modelConfigOverride;
-        if (!override) continue;
-        if (override.model)
-          this.params.model.model =
-            override.model as typeof this.params.model.model;
-        if (override.reasoningEffort)
-          this.params.model.reasoningEffort = override.reasoningEffort;
-        if (override.maxTokens)
-          this.params.model.maxTokens = Math.max(
-            this.params.model.maxTokens ?? 0,
-            override.maxTokens
-          );
+    // Apply capability model overrides and system prompt injections
+    await applyCapabilityPreprocessing(
+      this.params,
+      this.context,
+      this.resolveCapabilityCredentials.bind(this)
+    );
+
+    // Extract execution metadata (used for conversation history + agent memory)
+    const execMeta = this.context?.executionMeta;
+
+    // Memory injection — tools, prompt, and reflection are built externally (Pro)
+    // and passed via executionMeta. This keeps all memory logic out of OSS.
+    const isCapabilityAgent = this.params.name?.startsWith('Capability Agent:');
+
+    // Custom capability model override for sub-agents (master applies its own at detection time)
+    if (isCapabilityAgent) {
+      const customModelOverride = execMeta?._customCapModelOverride as
+        | {
+            masterModel: string;
+            delegateModel: string;
+            reasoningEffort?: 'low' | 'medium' | 'high';
+          }
+        | undefined;
+      if (customModelOverride) {
+        (this.params.model as Record<string, unknown>).model =
+          customModelOverride.delegateModel;
+        this.params.model.reasoningEffort =
+          customModelOverride.reasoningEffort ?? undefined;
       }
     }
 
-    // Inject capability system prompts
-    if (caps.length > 1) {
-      // Multi-capability: summaries with tool names + delegation hints — sub-agents get full prompts
-      const summaries = caps
-        .map((c) => {
-          const def = getCapability(c.id);
-          if (!def) return null;
-          const toolNames = def.metadata.tools.map((t) => t.name).join(', ');
-          let summary = `- "${def.metadata.name}" (id: ${c.id}): ${def.metadata.description}`;
-          if (toolNames) summary += `\n  Tools: ${toolNames}`;
-          if (def.metadata.delegationHint)
-            summary += `\n  When to use: ${def.metadata.delegationHint}`;
-          return summary;
-        })
-        .filter(Boolean);
+    // Inject Slack channel context into system prompt
+    // Skip for capability agents (e.g. memory) — they only need their own prompt
+    if (!isCapabilityAgent) {
+      const slackChannel = execMeta?._slackChannel;
+      if (slackChannel) {
+        this.params.systemPrompt = `${this.params.systemPrompt}\n**Current Slack channel:** ${slackChannel}`;
+      }
 
-      this.params.systemPrompt += `\n\nYou have the following capabilities. You MUST use the 'use-capability' tool to delegate tasks to them — NEVER handle a capability-related request yourself.\n${summaries.join('\n')}\n\nRULES:\n- ALWAYS call use-capability when the user's request could be handled by a capability. Do NOT respond directly.\n- Include all relevant context from the conversation in the task description.\n- You can call multiple capabilities in sequence if needed.\n- When in doubt, delegate — the capability will decide if it can help.\n- Only respond directly for greetings, clarifying questions, or requests that clearly don't match any capability.`;
-    } else {
-      // Single or zero capabilities: eager load as before
-      for (const capConfig of caps) {
-        const capDef = getCapability(capConfig.id);
-        if (!capDef) continue;
+      // Inject bot identity and mention format context
+      const botDisplayName = execMeta?._selfBotDisplayName as
+        | string
+        | undefined;
+      const selfBotUserId = execMeta?._selfBotUserId as string | undefined;
+      if (botDisplayName) {
+        let botContext = `**Your Slack identity:** ${botDisplayName}`;
+        if (selfBotUserId) {
+          botContext += ` (user ID: ${selfBotUserId})`;
+        }
+        botContext += `\nIn Slack messages, \`<@userId>\` is a mention — when you see \`<@${selfBotUserId ?? 'your_id'}>\`, that's someone addressing you.`;
+        botContext += `\nConversation messages are prefixed with \`[Name (userId)]\` — this tells you who sent each message. Use these names when addressing users.`;
+        this.params.systemPrompt = `${this.params.systemPrompt}\n${botContext}`;
+      }
+    }
 
-        const ctx: CapabilityRuntimeContext = {
-          credentials: this.resolveCapabilityCredentials(capDef, capConfig),
-          inputs: capConfig.inputs ?? {},
-          bubbleContext: this.context,
+    // Auto-inject trigger conversation history if no explicit conversationHistory was provided
+    // This enables Slack thread context to automatically flow into AI agents
+    // Skip for capability agents (e.g. memory) — they only need their own prompt
+    // Check both legacy path (context.triggerConversationHistory) and new path (executionMeta)
+    if (!isCapabilityAgent && !this.params.conversationHistory?.length) {
+      const convHistory =
+        (execMeta?.triggerConversationHistory as
+          | Array<{ role: 'user' | 'assistant'; content: string }>
+          | undefined) ??
+        (this.context?.triggerConversationHistory as
+          | Array<{ role: 'user' | 'assistant'; content: string }>
+          | undefined);
+      if (convHistory?.length) {
+        this.params.conversationHistory = convHistory;
+      }
+    }
+
+    if (!isCapabilityAgent && this.params.memoryEnabled) {
+      const memoryTools = execMeta?.memoryTools;
+      const memorySystemPrompt = execMeta?.memorySystemPrompt;
+
+      if (memoryTools?.length) {
+        if (!this.params.customTools) {
+          this.params.customTools = [];
+        }
+        this.params.customTools.push(...memoryTools);
+      }
+
+      if (memorySystemPrompt) {
+        this.params.systemPrompt = `${this.params.systemPrompt}\n\n---\n\n${memorySystemPrompt}`;
+      }
+
+      // Initialize callLLM for memory tools that need it (update_memory merge, reflection)
+      const memoryCallLLMInit = execMeta?.memoryCallLLMInit as
+        | ((callLLM: (prompt: string) => Promise<string>) => void)
+        | undefined;
+      if (memoryCallLLMInit) {
+        const memoryModel = ((execMeta?.memoryCallLLMModel as string) ||
+          RECOMMENDED_MODELS.PRO) as AvailableModel;
+        const callLLM = async (prompt: string): Promise<string> => {
+          const memoryAgent = new AIAgentBubble(
+            {
+              message: prompt,
+              systemPrompt:
+                'Respond concisely. Follow the instructions in the user message.',
+              name: 'Capability Agent: Memory',
+              model: {
+                model: memoryModel,
+                temperature: 0,
+                maxTokens: 4096,
+                maxRetries: 2,
+              },
+              credentials: this.params.credentials,
+              maxIterations: 4,
+            },
+            this.context,
+            'memory-agent'
+          );
+          const result = await memoryAgent.action();
+          return result.data?.response ?? '';
         };
+        memoryCallLLMInit(callLLM);
+      }
+    }
 
-        const addition =
-          (await capDef.createSystemPrompt?.(ctx)) ??
-          capDef.metadata.systemPromptAddition;
+    // Auto-inject image reading tool for Slack bot flows
+    // Slack images are pre-uploaded to R2 in conversation history, so URLs are public
+    if (!isCapabilityAgent && execMeta?._isSlackBot) {
+      const { buildReadImageTool } = await import('./ai-agent-slack-tools.js');
+      const imageTool = buildReadImageTool(this.params.credentials ?? {});
+      if (!this.params.customTools) {
+        this.params.customTools = [];
+      }
+      this.params.customTools.push(imageTool);
 
-        if (addition) {
-          this.params.systemPrompt = `${this.params.systemPrompt}\n\n${addition}`;
+      this.params.systemPrompt += `\n\n**Image Reading:** When users share images, the message will include \`[Attached files: ...]\` with image URLs. Use the \`read_image\` tool with these URLs to see and describe the image contents.`;
+    }
+
+    // Inject capability management tools (e.g., Pearl self-management)
+    if (!isCapabilityAgent) {
+      const capabilityTools = execMeta?.capabilityTools as
+        | Array<{
+            name: string;
+            description: string;
+            schema: z.ZodTypeAny;
+            func: (input: Record<string, unknown>) => Promise<string>;
+          }>
+        | undefined;
+
+      if (capabilityTools?.length) {
+        if (!this.params.customTools) {
+          this.params.customTools = [];
+        }
+        this.params.customTools.push(...capabilityTools);
+      }
+
+      const capabilitySystemPrompt = execMeta?.capabilitySystemPrompt as
+        | string
+        | undefined;
+      if (capabilitySystemPrompt) {
+        this.params.systemPrompt = `${this.params.systemPrompt}\n\n---\n\n${capabilitySystemPrompt}`;
+      }
+    }
+
+    // Custom capability detection — /name pattern in message injects stored prompt
+    const customCaps = execMeta?._availableCustomCapabilities as
+      | Record<
+          string,
+          {
+            systemPrompt: string;
+            name: string;
+            effort?: 'none' | 'low' | 'medium' | 'high';
+          }
+        >
+      | undefined;
+    if (customCaps && !isCapabilityAgent) {
+      // Match /command at start of message (optionally preceded by Slack mention)
+      const match = this.params.message.match(
+        /^(?:<@[A-Z0-9]+>\s*)?\/([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\b\s*([\s\S]*)$/
+      );
+      if (match) {
+        const cap = customCaps[match[1]];
+        if (cap) {
+          this.params.systemPrompt += `\n\n---\n\n[Custom Capability: ${match[1]}]\n${cap.systemPrompt}`;
+          this.params.message =
+            match[2].trim() || `(user invoked /${match[1]})`;
+
+          // Set model override based on effort level
+          const effort = cap.effort || 'medium';
+          const effortPresets: Record<
+            string,
+            {
+              masterModel: string;
+              delegateModel: string;
+              reasoningEffort?: 'low' | 'medium' | 'high';
+            }
+          > = {
+            none: {
+              masterModel: RECOMMENDED_MODELS.ANTHROPIC_FAST,
+              delegateModel: RECOMMENDED_MODELS.GOOGLE_FAST,
+            },
+            low: {
+              masterModel: RECOMMENDED_MODELS.ANTHROPIC_FAST,
+              delegateModel: RECOMMENDED_MODELS.ANTHROPIC_FAST,
+            },
+            medium: {
+              masterModel: RECOMMENDED_MODELS.ANTHROPIC_FLAGSHIP,
+              delegateModel: RECOMMENDED_MODELS.GOOGLE_FLAGSHIP,
+              reasoningEffort: 'medium',
+            },
+            high: {
+              masterModel: RECOMMENDED_MODELS.ANTHROPIC_BEST,
+              delegateModel: RECOMMENDED_MODELS.GOOGLE_BEST,
+              reasoningEffort: 'high',
+            },
+          };
+          const preset = effortPresets[effort];
+          execMeta!._customCapModelOverride = preset;
+
+          // Apply master model override immediately (sub-agents apply theirs in their own beforeAction)
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (this.params.model as Record<string, unknown>).model =
+            preset.masterModel;
+          this.params.model.reasoningEffort =
+            preset.reasoningEffort ?? undefined;
         }
       }
     }
-  }
-
-  /** Appends text from capability responseAppend factories to the final response. */
-  private async applyCapabilityResponseAppend(
-    result: AIAgentResult
-  ): Promise<AIAgentResult> {
-    const caps = this.params.capabilities ?? [];
-    // Multi-cap: sub-agents handle their own responseAppend
-    if (caps.length > 1) return result;
-
-    const appendParts: string[] = [];
-    for (const capConfig of caps) {
-      const capDef = getCapability(capConfig.id);
-      if (!capDef?.createResponseAppend) continue;
-
-      const ctx: CapabilityRuntimeContext = {
-        credentials: this.resolveCapabilityCredentials(capDef, capConfig),
-        inputs: capConfig.inputs ?? {},
-        bubbleContext: this.context,
-      };
-
-      const text = await capDef.createResponseAppend(ctx);
-      if (text) appendParts.push(text);
-    }
-
-    if (appendParts.length > 0) {
-      return {
-        ...result,
-        response: `${result.response}\n\n${appendParts.join('\n\n')}`,
-      };
-    }
-    return result;
   }
 
   protected async performAction(
@@ -671,9 +882,6 @@ export class AIAgentBubble extends ServiceBubble<
   ): Promise<AIAgentResult> {
     // Context is available but not currently used in this implementation
     void context;
-
-    // Apply param transformations before execution
-    await this.beforeAction();
 
     try {
       let result: AIAgentResult;
@@ -690,14 +898,35 @@ export class AIAgentBubble extends ServiceBubble<
 
       // Append capability response additions (e.g. tips, blurbs)
       if (result.success) {
-        result = await this.applyCapabilityResponseAppend(result);
+        result = await applyCapabilityPostprocessing(
+          result,
+          this.params,
+          this.context,
+          this.resolveCapabilityCredentials.bind(this)
+        );
       }
+
+      // Post-execution memory reflection — callback built externally (Pro)
+      this.runMemoryReflectionIfNeeded(result);
 
       return result;
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
       console.warn('[AIAgent] Execution error:', errorMessage);
+
+      // Notify executionMeta callback for agent-level errors (e.g. PostHog tracking)
+      this.context?.executionMeta?._onAgentError?.({
+        error: errorMessage,
+        model: this.params.model.model,
+        iterations: 0,
+        toolCalls: [],
+        conversationHistory: this.params.conversationHistory?.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+        variableId: this.context?.variableId,
+      });
 
       // Return error information but mark as recoverable
       return {
@@ -707,6 +936,58 @@ export class AIAgentBubble extends ServiceBubble<
         error: errorMessage,
         iterations: 0,
       };
+    }
+  }
+
+  /**
+   * Run post-execution memory reflection if a callback was provided via executionMeta.
+   * Fire-and-forget: doesn't block the response.
+   */
+  private runMemoryReflectionIfNeeded(result: AIAgentResult): void {
+    const isCapabilityAgent = this.params.name?.startsWith('Capability Agent:');
+    if (isCapabilityAgent || !result.success || !this.params.memoryEnabled) {
+      return;
+    }
+
+    const execMeta = this.context?.executionMeta;
+    const memoryReflectionCallback = execMeta?.memoryReflectionCallback;
+
+    if (!memoryReflectionCallback) return;
+
+    // Build conversation messages from the conversation history + current exchange
+    const messages: Array<{ role: string; content: string }> = [];
+
+    // Add conversation history
+    if (this.params.conversationHistory?.length) {
+      for (const msg of this.params.conversationHistory) {
+        messages.push({ role: msg.role, content: msg.content });
+      }
+    }
+
+    // Add the current user message
+    messages.push({ role: 'user', content: this.params.message });
+
+    // Add tool calls as context
+    if (result.toolCalls?.length) {
+      for (const tc of result.toolCalls) {
+        messages.push({
+          role: 'assistant',
+          content: `[Used tool: ${tc.tool}] Input: ${JSON.stringify(tc.input).slice(0, 200)}`,
+        });
+      }
+    }
+
+    // Add the final response
+    messages.push({ role: 'assistant', content: result.response });
+
+    // Fire-and-forget — but store promise so trace flush can await it
+    const reflectionPromise = memoryReflectionCallback(messages).catch(
+      (err) => {
+        console.error('[AIAgent] Memory reflection failed:', err);
+      }
+    );
+    if (execMeta) {
+      execMeta._reflectionPromise = reflectionPromise;
     }
   }
 
@@ -1050,9 +1331,11 @@ export class AIAgentBubble extends ServiceBubble<
               }
             : undefined;
 
-        return new ChatAnthropic({
+        const isThinking = thinkingConfig != null;
+        const anthropicModel = new ChatAnthropic({
           model: modelName,
-          temperature,
+          // Anthropic requires temperature=1 when thinking is enabled
+          temperature: isThinking ? 1 : temperature,
           anthropicApiKey: apiKey,
           maxTokens,
           streaming: true,
@@ -1060,6 +1343,15 @@ export class AIAgentBubble extends ServiceBubble<
           ...(thinkingConfig && { thinking: thinkingConfig }),
           maxRetries: retries,
         });
+        // LangChain 0.3.x defaults topP to -1 and only clears it for
+        // hardcoded model names (opus-4-1, sonnet-4-5, haiku-4-5).
+        // Newer models like opus-4-6 aren't whitelisted, so force-clear it.
+        // When thinking is enabled, topP must stay at -1 (sentinel for "not set")
+        // because Anthropic rejects topP with thinking.
+        if (!isThinking) {
+          anthropicModel.topP = undefined;
+        }
+        return anthropicModel;
       }
       case 'openrouter':
         console.log('openrouter', modelName);
@@ -1213,7 +1505,114 @@ export class AIAgentBubble extends ServiceBubble<
     // 3. Capability tools
     const caps = this.params.capabilities ?? [];
     if (caps.length > 1) {
-      // Multi-capability: delegation mode — register a single use-capability tool
+      // Multi-capability: register master-level tools directly on the master agent
+      for (const capConfig of caps) {
+        const capDef = getCapability(capConfig.id);
+        if (!capDef) continue;
+
+        const masterTools = capDef.metadata.tools.filter((t) => t.masterTool);
+        if (masterTools.length === 0) continue;
+
+        try {
+          const ctx: CapabilityRuntimeContext = {
+            credentials: this.resolveCapabilityCredentials(capDef, capConfig),
+            inputs: mergeCapabilityInputDefaults(
+              capDef.metadata.inputs,
+              capConfig.inputs
+            ),
+            bubbleContext: this.context,
+          };
+          const toolFuncs = capDef.createTools(ctx);
+          const logger = this.context?.logger;
+
+          for (const toolMeta of masterTools) {
+            const func = toolFuncs[toolMeta.name];
+            if (!func) continue;
+
+            const { variableId: capToolVariableId, uniqueId: capToolUniqueId } =
+              this.resolveCapabilityToolNode(toolMeta.name);
+
+            const capToolContext: BubbleContext | undefined = this.context
+              ? {
+                  ...this.context,
+                  variableId: capToolVariableId,
+                  currentUniqueId: capToolUniqueId,
+                  __uniqueIdCounters__: {},
+                }
+              : undefined;
+
+            const wrappedFunc = async (
+              input: Record<string, unknown>
+            ): Promise<unknown> => {
+              logger?.logBubbleExecution(
+                capToolVariableId,
+                toolMeta.name,
+                toolMeta.name,
+                input
+              );
+              try {
+                ctx.bubbleContext = capToolContext;
+                const result = await func(input);
+                ctx.bubbleContext = this.context;
+                logger?.logBubbleExecutionComplete(
+                  capToolVariableId,
+                  toolMeta.name,
+                  toolMeta.name,
+                  result
+                );
+                return result;
+              } catch (error) {
+                ctx.bubbleContext = this.context;
+                logger?.logBubbleExecutionComplete(
+                  capToolVariableId,
+                  toolMeta.name,
+                  toolMeta.name,
+                  { success: false, error: String(error) }
+                );
+                throw error;
+              }
+            };
+
+            const toolSchema = this.jsonSchemaToZod(toolMeta.parameterSchema);
+            const dynamicTool = new DynamicStructuredTool({
+              name: toolMeta.name,
+              description: toolMeta.description,
+              schema: toolSchema,
+              func: wrappedFunc as (
+                input: Record<string, unknown>
+              ) => Promise<unknown>,
+            } as any);
+
+            tools.push(dynamicTool);
+            console.log(
+              `🔧 [AIAgent] Registered master-level tool: ${toolMeta.name} (from ${capConfig.id})`
+            );
+          }
+
+          // Register hooks for master-level tools
+          if (capDef.hooks?.beforeToolCall) {
+            for (const t of masterTools) {
+              this.capabilityBeforeHooks.set(
+                t.name,
+                capDef.hooks.beforeToolCall
+              );
+            }
+          }
+          if (capDef.hooks?.afterToolCall) {
+            for (const t of masterTools) {
+              this.capabilityAfterHooks.set(t.name, capDef.hooks.afterToolCall);
+            }
+          }
+        } catch (error) {
+          console.error(
+            `Error initializing master-level tools for capability '${capConfig.id}':`,
+            error
+          );
+          continue;
+        }
+      }
+
+      // Register use-capability delegation tool
       const capIds = caps.map((c) => c.id);
       tools.push(
         new DynamicStructuredTool({
@@ -1227,7 +1626,7 @@ export class AIAgentBubble extends ServiceBubble<
             task: z
               .string()
               .describe(
-                'Clear description of what to do. Include any relevant context from the conversation.'
+                'Clear description of what to do. Include any relevant context from the conversation. Always include information about the users timezone and current time.'
               ),
           }),
           func: async (input: Record<string, unknown>) => {
@@ -1238,18 +1637,59 @@ export class AIAgentBubble extends ServiceBubble<
             if (!capConfig || !capDef)
               return { error: `Capability "${capabilityId}" not found` };
 
+            // Snapshot master agent state before delegation so that the
+            // subagent's beforeToolCall hook can save both states if an
+            // approval interrupt is triggered (fixes multi-cap state leak).
+            const execMeta = this.context?.executionMeta;
+            if (execMeta && this._currentGraphMessages.length > 0) {
+              const { mapChatMessagesToStoredMessages } = await import(
+                '@langchain/core/messages'
+              );
+              execMeta._masterAgentSnapshot = {
+                messages: mapChatMessagesToStoredMessages(
+                  this._currentGraphMessages
+                ) as unknown as Array<Record<string, unknown>>,
+                capabilityId,
+                capabilityTask: task,
+              };
+              this._trace(
+                'use-capability',
+                `snapshotted master state before delegating`,
+                {
+                  masterMessageCount: this._currentGraphMessages.length,
+                  capabilityId,
+                  capabilityTask: task,
+                }
+              );
+            }
+
             const subAgent = new AIAgentBubble(
               {
                 message: task,
                 systemPrompt: '', // capability's systemPrompt fills this via beforeAction
+                name: `Capability Agent: ${capDef.metadata.name}`,
                 model: { ...this.params.model },
                 capabilities: [capConfig], // single cap = eager load in sub-agent
                 credentials: this.params.credentials,
               },
-              this.context
+              this.context,
+              `capability-${capabilityId}`
             );
 
             const result = await subAgent.action();
+
+            // Clean up snapshot after delegation completes
+            if (execMeta) {
+              delete execMeta._masterAgentSnapshot;
+            }
+
+            this._trace('use-capability', `subAgent returned`, {
+              capabilityId,
+              success: result.success,
+              pendingApproval: !!execMeta?._pendingApproval,
+              shouldStopAfterTools: this.shouldStopAfterTools,
+            });
+
             if (!result.success) {
               return { success: false, error: result.error };
             }
@@ -1275,7 +1715,10 @@ export class AIAgentBubble extends ServiceBubble<
           // Shared ctx captured by all tool funcs via closure — we mutate bubbleContext per-tool
           const ctx: CapabilityRuntimeContext = {
             credentials: this.resolveCapabilityCredentials(capDef, capConfig),
-            inputs: capConfig.inputs ?? {},
+            inputs: mergeCapabilityInputDefaults(
+              capDef.metadata.inputs,
+              capConfig.inputs
+            ),
             bubbleContext: this.context,
           };
           const toolFuncs = capDef.createTools(ctx);
@@ -1351,6 +1794,19 @@ export class AIAgentBubble extends ServiceBubble<
             console.log(
               `🔧 [AIAgent] Registered capability tool: ${toolMeta.name} (from ${capConfig.id}, variableId: ${capToolVariableId})`
             );
+          }
+
+          // Wire capability-level hooks scoped to this capability's tool names
+          const capToolNames = capDef.metadata.tools.map((t) => t.name);
+          if (capDef.hooks?.beforeToolCall) {
+            for (const name of capToolNames) {
+              this.capabilityBeforeHooks.set(name, capDef.hooks.beforeToolCall);
+            }
+          }
+          if (capDef.hooks?.afterToolCall) {
+            for (const name of capToolNames) {
+              this.capabilityAfterHooks.set(name, capDef.hooks.afterToolCall);
+            }
           }
         } catch (error) {
           console.error(
@@ -1527,9 +1983,21 @@ export class AIAgentBubble extends ServiceBubble<
 
     const toolMessages: BaseMessage[] = [];
     let currentMessages = [...messages];
+    let hooksModifiedMessages = false;
+
+    // Keep master snapshot in sync so use-capability can capture state
+    this._currentGraphMessages = currentMessages;
 
     // Reset stop flag at the start of tool execution
     this.shouldStopAfterTools = false;
+
+    this._trace('executeToolsWithHooks', `ENTRY`, {
+      toolCallCount: toolCalls.length,
+      toolCalls: toolCalls
+        .map((tc) => `${tc.name}(${tc.id?.slice(-8)})`)
+        .join(', '),
+      totalMsgs: messages.length,
+    });
 
     // Execute each tool call
     for (const toolCall of toolCalls) {
@@ -1551,6 +2019,12 @@ export class AIAgentBubble extends ServiceBubble<
           },
         });
 
+        // Notify executionMeta callback (e.g. Slack thinking-message status updates)
+        this.context?.executionMeta?._onToolCallStart?.(
+          toolCall.name,
+          toolCall.args
+        );
+
         // Send tool_complete event with error
         this.streamingCallback?.({
           type: 'tool_call_complete',
@@ -1564,6 +2038,16 @@ export class AIAgentBubble extends ServiceBubble<
           },
         });
 
+        // Notify executionMeta callback for tool call errors (e.g. PostHog tracking)
+        this.context?.executionMeta?._onToolCallError?.({
+          toolName: toolCall.name,
+          toolInput: toolCall.args,
+          error: errorContent,
+          errorType: 'not_found',
+          variableId: this.context?.variableId,
+          model: this.params.model.model,
+        });
+
         const errorMessage = new ToolMessage({
           content: errorContent,
           tool_call_id: toolCall.id!,
@@ -1575,11 +2059,30 @@ export class AIAgentBubble extends ServiceBubble<
 
       const startTime = Date.now();
       try {
-        // Call beforeToolCall hook if provided
-        const hookResult_before = await this.beforeToolCallHook?.({
+        // Call beforeToolCall hook — capability-scoped hook takes priority, then global
+        const beforeHook =
+          this.capabilityBeforeHooks.get(toolCall.name) ??
+          this.beforeToolCallHook;
+        const hookResult_before = await beforeHook?.({
           toolName: toolCall.name as AvailableTool,
           toolInput: toolCall.args,
           messages: currentMessages,
+          bubbleContext: this.context,
+        });
+
+        // Trace hook result
+        if (beforeHook) {
+          this._trace('hook', `beforeToolCall:${toolCall.name}`, {
+            toolName: toolCall.name,
+            shouldSkip: hookResult_before?.shouldSkip ?? false,
+            messagesModified: !!hookResult_before?.messages,
+          });
+        }
+
+        this._trace('tool', `start:${toolCall.name}`, {
+          toolName: toolCall.name,
+          toolCallId: toolCall.id ?? '',
+          input: toolCall.args,
         });
 
         this.streamingCallback?.({
@@ -1592,41 +2095,99 @@ export class AIAgentBubble extends ServiceBubble<
           },
         });
 
+        // Notify executionMeta callback (e.g. Slack thinking-message status updates)
+        this.context?.executionMeta?._onToolCallStart?.(
+          toolCall.name,
+          toolCall.args
+        );
+
         // If hook returns modified messages/toolInput, apply them
         if (hookResult_before) {
           if (hookResult_before.messages) {
             currentMessages = hookResult_before.messages;
+            hooksModifiedMessages = true;
           }
           toolCall.args = hookResult_before.toolInput;
+
+          // If hook requests skipping, create synthetic ToolMessage and stop agent loop
+          if (hookResult_before.shouldSkip) {
+            this._trace('tool', `skipped:${toolCall.name}`, {
+              toolName: toolCall.name,
+              toolCallId: toolCall.id ?? '',
+              input: toolCall.args,
+              skipMessage:
+                hookResult_before.skipMessage || 'Tool execution was skipped.',
+              reason: 'beforeToolCall hook requested skip',
+            });
+            const skipMsg = new ToolMessage({
+              content:
+                hookResult_before.skipMessage || 'Tool execution was skipped.',
+              tool_call_id: toolCall.id!,
+            });
+            toolMessages.push(skipMsg);
+            currentMessages = [...currentMessages, skipMsg];
+            this.shouldStopAfterTools = true;
+            continue;
+          }
         }
 
         // Execute the tool
         const toolOutput = await tool.invoke(toolCall.args);
 
-        // Create tool message
+        // Create tool message — cap result size to avoid blowing up LLM context
+        let toolContent =
+          typeof toolOutput === 'string'
+            ? toolOutput
+            : JSON.stringify(toolOutput);
+        if (toolContent.length > AIAgentBubble.MAX_TOOL_RESULT_CHARS) {
+          toolContent =
+            toolContent.slice(0, AIAgentBubble.MAX_TOOL_RESULT_CHARS) +
+            `\n\n[... truncated — result was ${toolContent.length} chars, limit is ${AIAgentBubble.MAX_TOOL_RESULT_CHARS}]`;
+        }
         const toolMessage = new ToolMessage({
-          content:
-            typeof toolOutput === 'string'
-              ? toolOutput
-              : JSON.stringify(toolOutput),
+          content: toolContent,
           tool_call_id: toolCall.id!,
         });
 
         toolMessages.push(toolMessage);
         currentMessages = [...currentMessages, toolMessage];
 
-        // Call afterToolCall hook if provided
-        const hookResult_after = await this.afterToolCallHook?.({
+        const toolDurationMs = Date.now() - startTime;
+
+        this._trace('tool', `complete:${toolCall.name}`, {
+          toolName: toolCall.name,
+          toolCallId: toolCall.id ?? '',
+          input: toolCall.args,
+          output: toolOutput,
+          durationMs: toolDurationMs,
+        });
+
+        // Call afterToolCall hook — capability-scoped hook takes priority, then global
+        const afterHook =
+          this.capabilityAfterHooks.get(toolCall.name) ??
+          this.afterToolCallHook;
+        const hookResult_after = await afterHook?.({
           toolName: toolCall.name as AvailableTool,
           toolInput: toolCall.args,
           toolOutput,
           messages: currentMessages,
+          bubbleContext: this.context,
         });
+
+        // Trace hook result
+        if (afterHook) {
+          this._trace('hook', `afterToolCall:${toolCall.name}`, {
+            toolName: toolCall.name,
+            shouldStop: hookResult_after?.shouldStop ?? false,
+            messagesModified: !!hookResult_after?.messages,
+          });
+        }
 
         // If hook returns modified messages, update current messages
         if (hookResult_after) {
           if (hookResult_after.messages) {
             currentMessages = hookResult_after.messages;
+            hooksModifiedMessages = true;
           }
           // Check if hook wants to stop execution
           if (hookResult_after.shouldStop === true) {
@@ -1640,13 +2201,22 @@ export class AIAgentBubble extends ServiceBubble<
             input: toolCall.args as { input: string },
             tool: toolCall.name,
             output: toolOutput,
-            duration: Date.now() - startTime,
+            duration: toolDurationMs,
             variableId: this.context?.variableId,
           },
         });
       } catch (error) {
         console.error(`Error executing tool ${toolCall.name}:`, error);
         const errorContent = `Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
+
+        this._trace('tool', `error:${toolCall.name}`, {
+          toolName: toolCall.name,
+          toolCallId: toolCall.id ?? '',
+          input: toolCall.args,
+          error: errorContent,
+          durationMs: Date.now() - startTime,
+        });
+
         const errorMessage = new ToolMessage({
           content: errorContent,
           tool_call_id: toolCall.id!,
@@ -1666,21 +2236,25 @@ export class AIAgentBubble extends ServiceBubble<
             variableId: this.context?.variableId,
           },
         });
+
+        // Notify executionMeta callback for tool call errors (e.g. PostHog tracking)
+        this.context?.executionMeta?._onToolCallError?.({
+          toolName: toolCall.name,
+          toolInput: toolCall.args,
+          error: errorContent,
+          errorType: 'execution_error',
+          variableId: this.context?.variableId,
+          model: this.params.model.model,
+        });
       }
     }
 
-    // Return the updated messages
-    // If hooks modified messages, use those; otherwise use the original messages + tool messages
-    if (currentMessages.length !== messages.length + toolMessages.length) {
-      console.error(
-        '[AIAgent] Current messages length does not match expected length',
-        currentMessages.length,
-        messages.length,
-        toolMessages.length
-      );
+    // If hooks modified existing messages, return the full array so LangGraph's
+    // messagesStateReducer can merge by ID (update existing + append new).
+    // Otherwise, return only new tool messages for efficiency.
+    if (hooksModifiedMessages) {
       return { messages: currentMessages };
     }
-
     return { messages: toolMessages };
   }
 
@@ -1691,8 +2265,51 @@ export class AIAgentBubble extends ServiceBubble<
   ) {
     // Define the agent node
     const agentNode = async ({ messages }: typeof MessagesAnnotation.State) => {
+      this._trace('agentNode', `LLM CALL`, {
+        model: this.params.model.model,
+        temperature: this.params.model.temperature,
+        systemPrompt,
+        messageCount: messages.length,
+        messages: messages.map((m) => {
+          const role = m._getType();
+          const content =
+            typeof m.content === 'string'
+              ? m.content
+              : JSON.stringify(m.content);
+          const entry: Record<string, unknown> = { role, content };
+          if (
+            'tool_calls' in m &&
+            Array.isArray(m.tool_calls) &&
+            m.tool_calls.length > 0
+          ) {
+            entry.toolCalls = m.tool_calls.map(
+              (tc: Record<string, unknown>) => ({
+                name: tc.name,
+                id: tc.id,
+                args: tc.args,
+              })
+            );
+          }
+          if ('tool_call_id' in m) {
+            entry.toolCallId = m.tool_call_id;
+          }
+          return entry;
+        }),
+      });
       // systemPrompt is already enhanced by beforeAction() if expectedOutputSchema was provided
-      const systemMessage = new HumanMessage(systemPrompt);
+      // Use cache_control for Anthropic models to cache the system prompt across iterations
+      const isAnthropic = llm instanceof ChatAnthropic;
+      const systemMessage = isAnthropic
+        ? new SystemMessage({
+            content: [
+              {
+                type: 'text' as const,
+                text: systemPrompt,
+                cache_control: { type: 'ephemeral' as const },
+              },
+            ],
+          })
+        : new SystemMessage(systemPrompt);
       const allMessages = [systemMessage, ...messages];
 
       // Helper function for exponential backoff with jitter
@@ -1811,10 +2428,52 @@ export class AIAgentBubble extends ServiceBubble<
             ],
           });
 
+          this._trace('agentNode', 'LLM RESPONSE', {
+            content:
+              typeof response.content === 'string'
+                ? response.content
+                : JSON.stringify(response.content),
+            toolCalls:
+              'tool_calls' in response && Array.isArray(response.tool_calls)
+                ? response.tool_calls.map((tc: Record<string, unknown>) => ({
+                    name: tc.name,
+                    id: tc.id,
+                    args: tc.args,
+                  }))
+                : undefined,
+            tokenUsage: response.usage_metadata
+              ? {
+                  inputTokens: response.usage_metadata.input_tokens,
+                  outputTokens: response.usage_metadata.output_tokens,
+                  totalTokens: response.usage_metadata.total_tokens,
+                }
+              : undefined,
+          });
           return { messages: [response] };
         } else {
           // Non-streaming fallback
           const response = await modelWithTools.invoke(allMessages);
+          this._trace('agentNode', 'LLM RESPONSE', {
+            content:
+              typeof response.content === 'string'
+                ? response.content
+                : JSON.stringify(response.content),
+            toolCalls:
+              'tool_calls' in response && Array.isArray(response.tool_calls)
+                ? response.tool_calls.map((tc: Record<string, unknown>) => ({
+                    name: tc.name,
+                    id: tc.id,
+                    args: tc.args,
+                  }))
+                : undefined,
+            tokenUsage: response.usage_metadata
+              ? {
+                  inputTokens: response.usage_metadata.input_tokens,
+                  outputTokens: response.usage_metadata.output_tokens,
+                  totalTokens: response.usage_metadata.total_tokens,
+                }
+              : undefined,
+          });
           return { messages: [response] };
         }
       } catch (error) {
@@ -1866,6 +2525,28 @@ export class AIAgentBubble extends ServiceBubble<
       const hasToolCalls = !!(
         lastMessage.tool_calls && lastMessage.tool_calls.length > 0
       );
+
+      // Built-in rescue: detect garbage response after tool use
+      if (!hasToolCalls && isGarbageResponse(lastMessage.content)) {
+        const hadToolUse = messages.some((m) => m instanceof ToolMessage);
+        if (
+          hadToolUse &&
+          this.rescueAttempts < AIAgentBubble.MAX_RESCUE_ATTEMPTS
+        ) {
+          this.rescueAttempts++;
+          console.warn(
+            `[AIAgent] Garbage response detected ("${String(lastMessage.content).substring(0, 50)}"), attempting rescue (${this.rescueAttempts}/${AIAgentBubble.MAX_RESCUE_ATTEMPTS})`
+          );
+          this.shouldContinueToAgent = true;
+          return {
+            messages: [
+              new HumanMessage(
+                'Your last response was empty or invalid. Please provide a clear, helpful response summarizing what you did and the results.'
+              ),
+            ],
+          };
+        }
+      }
 
       // Only call hook if we're about to end (no tool calls) and hook is provided
       if (!hasToolCalls && this.afterLLMCallHook) {
@@ -1919,18 +2600,58 @@ export class AIAgentBubble extends ServiceBubble<
 
       // Check if the last AI message has tool calls
       if (lastAIMessage?.tool_calls && lastAIMessage.tool_calls.length > 0) {
+        this._trace('afterLLMCheck', `→ tools`, {
+          result: 'tools',
+          toolCallCount: lastAIMessage.tool_calls.length,
+          toolCalls: lastAIMessage.tool_calls
+            .map((tc) => `${tc.name}(${tc.id?.slice(-8)})`)
+            .join(', '),
+        });
         return 'tools';
       }
+      this._trace('afterLLMCheck', `→ __end__ (no tool calls)`, {
+        result: '__end__',
+        reason: 'no tool calls',
+      });
       return '__end__';
     };
 
     // Define conditional edge after tools to check if we should stop
     const shouldContinueAfterTools = () => {
+      const execMeta = this.context?.executionMeta;
+      this._trace('shouldContinueAfterTools', `CHECK`, {
+        shouldStopAfterTools: this.shouldStopAfterTools,
+        pendingApproval: !!execMeta?._pendingApproval,
+      });
       // Check if the afterToolCall hook requested stopping
       if (this.shouldStopAfterTools) {
+        this._trace(
+          'shouldContinueAfterTools',
+          `→ __end__ (shouldStopAfterTools)`,
+          {
+            result: '__end__',
+            reason: 'shouldStopAfterTools',
+            shouldStopAfterTools: true,
+          }
+        );
+        return '__end__';
+      }
+      // Check for pending approval signal from sub-agent (shared via executionMeta).
+      // In multi-capability mode the master and sub-agent share the same BubbleContext,
+      // so a sub-agent setting _pendingApproval is visible here.
+      if (execMeta?._pendingApproval) {
+        this._trace('shouldContinueAfterTools', `→ __end__ (pendingApproval)`, {
+          result: '__end__',
+          reason: 'pendingApproval',
+          pendingApproval: true,
+        });
+        this.shouldStopAfterTools = true;
         return '__end__';
       }
       // Otherwise continue back to agent
+      this._trace('shouldContinueAfterTools', `→ agent (continue)`, {
+        result: 'agent',
+      });
       return 'agent';
     };
 
@@ -1971,7 +2692,8 @@ export class AIAgentBubble extends ServiceBubble<
     images: AIAgentParamsParsed['images'],
     maxIterations: number,
     modelConfig: AIAgentParamsParsed['model'],
-    conversationHistory?: AIAgentParamsParsed['conversationHistory']
+    conversationHistory?: AIAgentParamsParsed['conversationHistory'],
+    tools?: DynamicStructuredTool[]
   ): Promise<AIAgentResult> {
     const jsonMode = modelConfig.jsonMode;
     const toolCalls: AIAgentResult['toolCalls'] = [];
@@ -1980,11 +2702,362 @@ export class AIAgentBubble extends ServiceBubble<
     try {
       // Build messages array starting with conversation history (for KV cache optimization)
       const initialMessages: BaseMessage[] = [];
+      let enrichedMessage: string | undefined;
 
-      // Convert conversation history to LangChain messages if provided
-      // This enables KV cache optimization by keeping previous turns as separate messages
-      if (conversationHistory && conversationHistory.length > 0) {
-        for (const historyMsg of conversationHistory) {
+      // Resume from saved agent state (lossless — preserves tool_calls, etc.)
+      const resumeExecMeta = this.context?.executionMeta;
+      const resumeStateV2 = resumeExecMeta?._resumeAgentStateV2;
+      const resumeState = resumeExecMeta?._resumeAgentState;
+      // Clear stale _pendingApproval ONLY when actually resuming, so that
+      // non-resume executeAgent calls (e.g. personality reflection) don't
+      // wipe the flag before postFlowAction reads it.
+      if (resumeExecMeta && (resumeStateV2 || resumeState)) {
+        delete resumeExecMeta._pendingApproval;
+      }
+
+      if (resumeStateV2 && resumeStateV2.__version === 2) {
+        // V2: Multi-cap scoped resume — master and subagent states are separate.
+        // Restore the master's messages, find the pending use-capability call,
+        // inject the subagent's state so it resumes via the V1 path, then
+        // execute the use-capability tool directly.
+        this._trace('v2-resume', `START`, {
+          masterMsgs: resumeStateV2.masterState.length,
+          subagentMsgs: resumeStateV2.subagentState.length,
+          capabilityId: resumeStateV2.capabilityId,
+          task: resumeStateV2.capabilityTask?.slice(0, 80),
+        });
+        const { mapStoredMessagesToChatMessages } = await import(
+          '@langchain/core/messages'
+        );
+        const masterRestored = mapStoredMessagesToChatMessages(
+          resumeStateV2.masterState as unknown as Parameters<
+            typeof mapStoredMessagesToChatMessages
+          >[0]
+        );
+
+        // Collect existing tool results
+        const existingToolResultIds = new Set<string>();
+        for (const msg of masterRestored) {
+          if (msg._getType() === 'tool') {
+            const tm = msg as ToolMessage;
+            if (tm.tool_call_id) existingToolResultIds.add(tm.tool_call_id);
+          }
+        }
+
+        // Build tool lookup for direct execution
+        const toolsByName = new Map<string, DynamicStructuredTool>();
+        if (tools) {
+          for (const t of tools) toolsByName.set(t.name, t);
+        }
+
+        // Inject the subagent's state so the use-capability tool's subagent
+        // picks it up via the V1 resume path in its own executeAgent call.
+        // IMPORTANT: Delete _resumeAgentStateV2 BEFORE tool.invoke() so the
+        // subagent doesn't re-enter the V2 path (it shares executionMeta).
+        if (resumeExecMeta) {
+          resumeExecMeta._resumeAgentState = resumeStateV2.subagentState;
+          delete resumeExecMeta._resumeAgentStateV2;
+        }
+
+        // Repair master messages: find the pending use-capability tool call
+        // and execute it (which re-creates the subagent that resumes via V1).
+        const repairedMessages: BaseMessage[] = [];
+        for (let i = 0; i < masterRestored.length; i++) {
+          repairedMessages.push(masterRestored[i]);
+          const msg = masterRestored[i];
+          if (msg._getType() !== 'ai') continue;
+
+          const aiMsg = msg as AIMessage;
+          const pendingCalls = aiMsg.tool_calls?.filter(
+            (tc) => tc.id && !existingToolResultIds.has(tc.id)
+          );
+          if (!pendingCalls?.length) continue;
+
+          for (const tc of pendingCalls) {
+            if (toolsByName.has(tc.name)) {
+              try {
+                this._trace('v2-resume', `executing tool "${tc.name}"`, {
+                  callId: tc.id,
+                  args: JSON.stringify(tc.args).slice(0, 200),
+                });
+                const tool = toolsByName.get(tc.name)!;
+                // Sync _currentGraphMessages so use-capability can snapshot
+                // master state for the subagent's beforeToolCall hook.
+                // Without this, _masterAgentSnapshot is empty during V2 resume
+                // and subsequent approvals fall to the V1 path, corrupting state.
+                this._currentGraphMessages = [...repairedMessages];
+                const result = await tool.invoke(tc.args);
+                let content =
+                  typeof result === 'string' ? result : JSON.stringify(result);
+                if (content.length > AIAgentBubble.MAX_TOOL_RESULT_CHARS) {
+                  content =
+                    content.slice(0, AIAgentBubble.MAX_TOOL_RESULT_CHARS) +
+                    `\n\n[... truncated — result was ${content.length} chars, limit is ${AIAgentBubble.MAX_TOOL_RESULT_CHARS}]`;
+                }
+                repairedMessages.push(
+                  new ToolMessage({ content, tool_call_id: tc.id! })
+                );
+              } catch (err) {
+                console.warn(
+                  `[AIAgent] V2 resume: tool execution failed for "${tc.name}":`,
+                  err
+                );
+                repairedMessages.push(
+                  new ToolMessage({
+                    content: `Tool execution failed: ${err instanceof Error ? err.message : String(err)}`,
+                    tool_call_id: tc.id!,
+                  })
+                );
+              }
+            } else {
+              repairedMessages.push(
+                new ToolMessage({
+                  content:
+                    'This action has been approved by the user. You may now execute this tool.',
+                  tool_call_id: tc.id!,
+                })
+              );
+            }
+            existingToolResultIds.add(tc.id!);
+          }
+        }
+
+        // Clean up remaining resume state and pre-approval flag so that
+        // subsequent subagents (created by normal master loop) don't
+        // accidentally pick up stale state.
+        // Note: _resumeAgentStateV2 already deleted above (before tool.invoke).
+        if (resumeExecMeta) {
+          delete resumeExecMeta._resumeAgentState;
+          delete resumeExecMeta._approvedAction;
+        }
+
+        this._trace('v2-resume', `DONE`, {
+          repairedMessages: repairedMessages.length,
+          types: repairedMessages.map((m) => m._getType()).join(','),
+          pendingApproval: !!resumeExecMeta?._pendingApproval,
+          shouldStopAfterTools: this.shouldStopAfterTools,
+        });
+        // If a new approval was triggered during V2 resume (subagent set _pendingApproval),
+        // skip the agent loop entirely. The subagent is blocked on approval — running the
+        // master LLM would just see an empty response and re-delegate, creating duplicate
+        // approvals. Return the last AI message from the repaired messages as the response.
+        if (resumeExecMeta?._pendingApproval) {
+          const approval = resumeExecMeta._pendingApproval as {
+            action?: string;
+            targetFlowName?: string;
+          };
+          this._trace(
+            'v2-resume',
+            `_pendingApproval detected — skipping agent loop`,
+            {
+              action: approval.action,
+              targetFlowName: approval.targetFlowName,
+            }
+          );
+          // Use the subagent's last AI text (captured in _pendingApproval)
+          // as the response. Do NOT use the master's original AI text — that
+          // would cause the same stale message to be posted to Slack on every resume.
+          const lastAIText = (
+            resumeExecMeta._pendingApproval as { lastAIText?: string }
+          ).lastAIText;
+          const action = approval.action ?? 'proceed';
+          const flowName = approval.targetFlowName;
+          const resumeResponse = lastAIText
+            ? lastAIText
+            : flowName
+              ? `Requesting approval to **${action}** "${flowName}".`
+              : `Requesting approval to **${action}**.`;
+          const formattedResult = formatFinalResponse(
+            resumeResponse,
+            modelConfig.model,
+            jsonMode
+          );
+          return {
+            response: formattedResult.response,
+            toolCalls: [],
+            iterations: 0,
+            error: '',
+            success: true,
+          };
+        }
+        initialMessages.push(...repairedMessages);
+      } else if (
+        resumeState &&
+        Array.isArray(resumeState) &&
+        resumeState.length > 0
+      ) {
+        const { mapStoredMessagesToChatMessages } = await import(
+          '@langchain/core/messages'
+        );
+        const restored = mapStoredMessagesToChatMessages(
+          resumeState as unknown as Parameters<
+            typeof mapStoredMessagesToChatMessages
+          >[0]
+        );
+        this._trace('v1-resume', `START`, {
+          savedMessageCount: resumeState.length,
+          restoredMessageCount: restored.length,
+          restoredMessages: restored.map((m) => {
+            const role = m._getType();
+            const content =
+              typeof m.content === 'string'
+                ? m.content
+                : JSON.stringify(m.content);
+            const entry: Record<string, unknown> = { role, content };
+            if (
+              'tool_calls' in m &&
+              Array.isArray(m.tool_calls) &&
+              m.tool_calls.length > 0
+            ) {
+              entry.toolCalls = m.tool_calls.map(
+                (tc: Record<string, unknown>) => ({
+                  name: tc.name,
+                  id: tc.id,
+                  args: tc.args,
+                })
+              );
+            }
+            if ('tool_call_id' in m) {
+              entry.toolCallId = m.tool_call_id;
+            }
+            return entry;
+          }),
+        });
+        // Collect existing tool_call_ids that already have ToolMessage responses
+        const existingToolResultIds = new Set<string>();
+        for (const msg of restored) {
+          if (msg._getType() === 'tool') {
+            const tm = msg as ToolMessage;
+            if (tm.tool_call_id) existingToolResultIds.add(tm.tool_call_id);
+          }
+        }
+
+        // Find AIMessages with unresolved tool_calls (no matching ToolMessage)
+        // The LAST such AIMessage is the one that triggered approval
+        let approvalAiMsgIndex = -1;
+        for (let i = restored.length - 1; i >= 0; i--) {
+          const msg = restored[i];
+          if (msg._getType() === 'ai') {
+            const aiMsg = msg as AIMessage;
+            const pending = aiMsg.tool_calls?.filter(
+              (tc) => tc.id && !existingToolResultIds.has(tc.id)
+            );
+            if (pending?.length) {
+              approvalAiMsgIndex = i;
+              break;
+            }
+          }
+        }
+
+        // Build a lookup of available tools by name for direct execution
+        const toolsByName = new Map<string, DynamicStructuredTool>();
+        if (tools) {
+          for (const t of tools) toolsByName.set(t.name, t);
+        }
+
+        // Process all AIMessages: execute or add synthetic results for unresolved tool_calls
+        // We iterate in order and insert ToolMessages right after their AIMessage
+        const repairedMessages: BaseMessage[] = [];
+        for (let i = 0; i < restored.length; i++) {
+          repairedMessages.push(restored[i]);
+          const msg = restored[i];
+          if (msg._getType() !== 'ai') continue;
+
+          const aiMsg = msg as AIMessage;
+          const pendingCalls = aiMsg.tool_calls?.filter(
+            (tc) => tc.id && !existingToolResultIds.has(tc.id)
+          );
+          if (!pendingCalls?.length) continue;
+
+          for (const tc of pendingCalls) {
+            if (i === approvalAiMsgIndex && toolsByName.has(tc.name)) {
+              // This is the approval-triggering AIMessage — execute the tool directly
+              // This bypasses beforeToolCall (no re-approval check) and gives real results
+              const resumeStartTime = Date.now();
+              this._trace('tool', `start:${tc.name}`, {
+                toolName: tc.name,
+                toolCallId: tc.id ?? '',
+                input: tc.args,
+                resumeDirect: true,
+              });
+              try {
+                console.log(
+                  `[AIAgent] Resume: executing approved tool "${tc.name}" directly`
+                );
+                const tool = toolsByName.get(tc.name)!;
+                const result = await tool.invoke(tc.args);
+                let content =
+                  typeof result === 'string' ? result : JSON.stringify(result);
+                if (content.length > AIAgentBubble.MAX_TOOL_RESULT_CHARS) {
+                  content =
+                    content.slice(0, AIAgentBubble.MAX_TOOL_RESULT_CHARS) +
+                    `\n\n[... truncated — result was ${content.length} chars, limit is ${AIAgentBubble.MAX_TOOL_RESULT_CHARS}]`;
+                }
+                this._trace('tool', `complete:${tc.name}`, {
+                  toolName: tc.name,
+                  toolCallId: tc.id ?? '',
+                  input: tc.args,
+                  output: result,
+                  durationMs: Date.now() - resumeStartTime,
+                  resumeDirect: true,
+                });
+                repairedMessages.push(
+                  new ToolMessage({ content, tool_call_id: tc.id! })
+                );
+              } catch (err) {
+                console.warn(
+                  `[AIAgent] Resume: direct tool execution failed for "${tc.name}":`,
+                  err
+                );
+                this._trace('tool', `error:${tc.name}`, {
+                  toolName: tc.name,
+                  toolCallId: tc.id ?? '',
+                  input: tc.args,
+                  error: err instanceof Error ? err.message : String(err),
+                  durationMs: Date.now() - resumeStartTime,
+                  resumeDirect: true,
+                });
+                repairedMessages.push(
+                  new ToolMessage({
+                    content: `Tool execution failed: ${err instanceof Error ? err.message : String(err)}`,
+                    tool_call_id: tc.id!,
+                  })
+                );
+              }
+            } else {
+              // Safety net: synthetic result for any other unresolved tool_calls
+              repairedMessages.push(
+                new ToolMessage({
+                  content:
+                    'This action has been approved by the user. You may now execute this tool.',
+                  tool_call_id: tc.id!,
+                })
+              );
+            }
+            existingToolResultIds.add(tc.id!);
+          }
+        }
+
+        // Clear pre-approval flag after resume repair executed the tool directly.
+        // This prevents the agent loop from approving a duplicate call if the LLM
+        // re-emits the same tool invocation.
+        if (approvalAiMsgIndex >= 0 && resumeExecMeta?._approvedAction) {
+          delete resumeExecMeta._approvedAction;
+        }
+
+        this._trace('v1-resume', `DONE`, {
+          repairedMessageCount: repairedMessages.length,
+          types: repairedMessages.map((m) => m._getType()).join(','),
+        });
+
+        initialMessages.push(...repairedMessages);
+      } else if (conversationHistory && conversationHistory.length > 0) {
+        // Normal path: lossy ConversationMessage[] → BaseMessage[]
+        // This enables KV cache optimization by keeping previous turns as separate messages
+        // Pop the trigger (last entry) — its enriched content replaces the raw message below
+        const lastHistoryMsg =
+          conversationHistory[conversationHistory.length - 1];
+        for (const historyMsg of conversationHistory.slice(0, -1)) {
           switch (historyMsg.role) {
             case 'user':
               initialMessages.push(new HumanMessage(historyMsg.content));
@@ -2006,9 +3079,16 @@ export class AIAgentBubble extends ServiceBubble<
               break;
           }
         }
+        // Use the enriched content from the last conversation history entry
+        // (includes user name, timezone) instead of the raw trigger message
+        if (lastHistoryMsg.role === 'user') {
+          enrichedMessage = lastHistoryMsg.content;
+        }
       }
 
       // Create the current human message with text and optional images
+      // Prefer enriched message (with user name/timezone) over raw trigger text
+      const triggerMessage = enrichedMessage ?? message;
       let humanMessage: HumanMessage;
 
       if (images && images.length > 0) {
@@ -2023,7 +3103,7 @@ export class AIAgentBubble extends ServiceBubble<
           type: string;
           text?: string;
           image_url?: { url: string };
-        }> = [{ type: 'text', text: message }];
+        }> = [{ type: 'text', text: triggerMessage }];
 
         // Add images to content
         for (const image of images) {
@@ -2079,17 +3159,33 @@ export class AIAgentBubble extends ServiceBubble<
         humanMessage = new HumanMessage({ content });
       } else {
         // Text-only message
-        humanMessage = new HumanMessage(message);
+        humanMessage = new HumanMessage(triggerMessage);
       }
 
-      // Add the current message to the conversation
-      initialMessages.push(humanMessage);
+      // In the resume flow the trigger message is already part of the saved
+      // state (it was the HumanMessage that started the original execution).
+      // Re-appending it causes the LLM to see the same request twice, which
+      // triggers a duplicate tool call.  Skip it when resuming.
+      if (!resumeState && !resumeStateV2) {
+        initialMessages.push(humanMessage);
+      }
+
+      this._trace('agent-loop', `STARTING graph.invoke`, {
+        initialMessageCount: initialMessages.length,
+        maxIterations,
+        model: this.params.model.model,
+      });
 
       const result = await graph.invoke(
         { messages: initialMessages },
         { recursionLimit: maxIterations }
       );
 
+      this._trace('agent-loop', `graph.invoke COMPLETED`, {
+        totalMessages: result.messages.length,
+        pendingApproval: !!this.context?.executionMeta?._pendingApproval,
+        model: this.params.model.model,
+      });
       console.log('[AIAgent] Graph execution completed');
       console.log('[AIAgent] Total messages:', result.messages.length);
       iterations = result.messages.length;
@@ -2235,6 +3331,19 @@ export class AIAgentBubble extends ServiceBubble<
       );
       // If there's an error from formatting (e.g., invalid JSON), return early
       if (formattedResult.error) {
+        // Notify executionMeta callback for agent-level errors (e.g. PostHog tracking)
+        this.context?.executionMeta?._onAgentError?.({
+          error: formattedResult.error,
+          model: modelConfig.model,
+          iterations,
+          toolCalls: toolCalls.length > 0 ? toolCalls : [],
+          conversationHistory: this.params.conversationHistory?.map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+          variableId: this.context?.variableId,
+        });
+
         return {
           response: formattedResult.response,
           toolCalls: toolCalls.length > 0 ? toolCalls : [],
@@ -2245,6 +3354,30 @@ export class AIAgentBubble extends ServiceBubble<
       }
 
       const finalResponse = formattedResult.response;
+
+      // When an approval is pending, the master's final response is typically
+      // a memory JSON — override with the subagent's reasoning text instead.
+      const execMeta = this.context?.executionMeta;
+      if (execMeta?._pendingApproval) {
+        const pendingApproval = execMeta._pendingApproval as {
+          lastAIText?: string;
+          action?: string;
+          targetFlowName?: string;
+        };
+        const approvalResponse =
+          pendingApproval.lastAIText ||
+          (pendingApproval.targetFlowName
+            ? `Requesting approval to **${pendingApproval.action}** "${pendingApproval.targetFlowName}".`
+            : `Requesting approval to **${pendingApproval.action}**.`);
+
+        return {
+          response: approvalResponse,
+          toolCalls: toolCalls.length > 0 ? toolCalls : [],
+          iterations,
+          error: '',
+          success: true,
+        };
+      }
 
       console.log(
         '[AIAgent] Final response length:',
@@ -2299,6 +3432,19 @@ export class AIAgentBubble extends ServiceBubble<
 
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
+
+      // Notify executionMeta callback for agent-level errors (e.g. PostHog tracking)
+      this.context?.executionMeta?._onAgentError?.({
+        error: errorMessage,
+        model: modelConfig.model,
+        iterations,
+        toolCalls: toolCalls.length > 0 ? toolCalls : [],
+        conversationHistory: this.params.conversationHistory?.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+        variableId: this.context?.variableId,
+      });
 
       // Return partial results to allow execution to continue
       // Include any tool calls that were completed before the error

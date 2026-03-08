@@ -1,6 +1,9 @@
 import { ServiceBubble } from '../../../types/service-bubble-class.js';
 import type { BubbleContext } from '../../../types/bubble.js';
-import { CredentialType } from '@bubblelab/shared-schemas';
+import {
+  CredentialType,
+  decodeCredentialPayload,
+} from '@bubblelab/shared-schemas';
 import {
   ConfluenceParamsSchema,
   ConfluenceResultSchema,
@@ -95,15 +98,14 @@ export class ConfluenceBubble<
       throw new Error('Confluence credentials are required');
     }
 
-    try {
-      const response = await this.makeConfluenceApiRequest(
-        '/wiki/api/v2/spaces?limit=1',
-        'GET'
-      );
-      return Boolean(response && 'results' in response);
-    } catch {
-      return false;
+    const response = await this.makeConfluenceApiRequest(
+      '/wiki/api/v2/spaces?limit=1',
+      'GET'
+    );
+    if (!response || !('results' in response)) {
+      throw new Error('Confluence API returned unexpected response');
     }
+    return true;
   }
 
   /**
@@ -128,10 +130,11 @@ export class ConfluenceBubble<
     }
 
     try {
-      const decoded = Buffer.from(confluenceCredRaw, 'base64').toString(
-        'utf-8'
-      );
-      const parsed = JSON.parse(decoded);
+      const parsed = decodeCredentialPayload<{
+        accessToken?: string;
+        cloudId?: string;
+        siteUrl?: string;
+      }>(confluenceCredRaw);
 
       if (parsed.accessToken && parsed.cloudId) {
         return {

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { AvailableModels, type AvailableModel } from './ai-models.js';
-import { RECOMMENDED_MODELS } from './bubbleflow-generation-prompts.js';
+import { RECOMMENDED_MODELS } from './ai-models.js';
 
 // Default model for Rice evaluation agent
 export const RICE_DEFAULT_MODEL: AvailableModel = RECOMMENDED_MODELS.FAST;

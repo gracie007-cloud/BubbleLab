@@ -2,6 +2,7 @@ import {
   ExecutionResult,
   ParsedBubbleWithInfo,
   CredentialType,
+  type ExecutionMeta,
 } from '@bubblelab/shared-schemas';
 import {
   BubbleFactory,
@@ -42,6 +43,7 @@ export interface BubbleRunnerOptions {
   useWebhookLogger?: boolean;
   pricingTable: Record<string, { unit: string; unitCost: number }>;
   userCredentialMapping?: Map<number, Set<CredentialType>>;
+  executionMeta?: ExecutionMeta;
 }
 
 export class BubbleRunner {
@@ -406,10 +408,16 @@ export class BubbleRunner {
 
       this.bubbleScript.showScript('Prepared script for execution');
 
-      // Create a temporary file with the bubble script code in the project directory
-      // This ensures proper module resolution for @nodex packages
+      // Create a temporary file in node_modules/.cache/bubblelab to ensure:
+      // 1. Proper module resolution for @bubblelab packages (stays within project)
+      // 2. No triggering of file watchers (node_modules is ignored by --watch)
       const projectRoot = this.findProjectRoot();
-      const tempDir = path.join(projectRoot, '.tmp');
+      const tempDir = path.join(
+        projectRoot,
+        'node_modules',
+        '.cache',
+        'bubblelab'
+      );
 
       // Ensure temp directory exists
       try {
@@ -477,6 +485,11 @@ export class BubbleRunner {
       // Instantiate the flow class with logger
       // Note: We need to determine the constructor parameters from the class
       const flowInstance = this.instantiateFlowClass(FlowClass);
+
+      // Attach execution metadata so generated code can thread it into BubbleContext
+      if (this.options.executionMeta) {
+        (flowInstance as any).__executionMeta__ = this.options.executionMeta;
+      }
 
       // Ensure the logger is set on the flow instance
       if (this.logger) {

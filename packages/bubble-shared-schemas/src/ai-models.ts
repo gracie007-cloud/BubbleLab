@@ -15,16 +15,21 @@ export const AvailableModels = z.enum([
   'google/gemini-3-pro-preview',
   'google/gemini-3-pro-image-preview',
   'google/gemini-3-flash-preview',
+  'google/gemini-3.1-pro-preview',
   // Anthropic models
   'anthropic/claude-sonnet-4-5',
+  'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-5',
+  'anthropic/claude-opus-4-6',
   'anthropic/claude-haiku-4-5',
   // OpenRouter models
   'openrouter/x-ai/grok-code-fast-1',
   'openrouter/z-ai/glm-4.6',
   'openrouter/z-ai/glm-4.7',
   'openrouter/anthropic/claude-sonnet-4.5',
+  'openrouter/anthropic/claude-sonnet-4.6',
   'openrouter/anthropic/claude-opus-4.5',
+  'openrouter/anthropic/claude-opus-4.6',
   'openrouter/google/gemini-3-pro-preview',
   'openrouter/morph/morph-v3-large',
   'openrouter/openai/gpt-oss-120b',
@@ -33,3 +38,30 @@ export const AvailableModels = z.enum([
 ]);
 
 export type AvailableModel = z.infer<typeof AvailableModels>;
+
+// Recommended models by tier — Best (premium/reasoning), Flagship (strong general), Fast (fast/cheap)
+export const RECOMMENDED_MODELS = {
+  // Best — premium/reasoning: Pro, Opus, GPT-o
+  GOOGLE_BEST: 'google/gemini-3.1-pro-preview',
+  ANTHROPIC_BEST: 'anthropic/claude-opus-4-6',
+  OPENAI_BEST: 'openai/gpt-5.2',
+  // Flagship — strong general: Flash, Sonnet, GPT-5
+  GOOGLE_FLAGSHIP: 'google/gemini-3-flash-preview',
+  ANTHROPIC_FLAGSHIP: 'anthropic/claude-sonnet-4-6',
+  OPENAI_FLAGSHIP: 'openai/gpt-5',
+  // Fast — fast/cheap: Flash Lite, Haiku, GPT-5-mini
+  GOOGLE_FAST: 'google/gemini-2.5-flash-lite',
+  ANTHROPIC_FAST: 'anthropic/claude-haiku-4-5',
+  OPENAI_FAST: 'openai/gpt-5-mini',
+  // Special-purpose
+  IMAGE: 'google/gemini-3-pro-image-preview',
+  // Legacy aliases (unchanged behavior)
+  BEST: 'google/gemini-3-pro-preview',
+  BEST_ALT: 'openai/gpt-5.2',
+  PRO: 'google/gemini-3-flash-preview',
+  PRO_ALT: 'anthropic/claude-sonnet-4-5',
+  FAST: 'google/gemini-2.5-flash-lite',
+  FAST_ALT: 'anthropic/claude-haiku-4-5',
+  LITE: 'google/gemini-2.5-flash-lite',
+  CHAT: 'anthropic/claude-sonnet-4-6',
+} as Record<string, AvailableModel>;

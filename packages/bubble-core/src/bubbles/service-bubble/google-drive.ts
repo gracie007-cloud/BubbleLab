@@ -423,6 +423,10 @@ const GoogleDriveParamsSchema = z.discriminatedUnion('operation', [
       .optional()
       .default('modifiedTime desc')
       .describe('Order results by field (e.g., "name", "modifiedTime desc")'),
+    page_token: z
+      .string()
+      .optional()
+      .describe('Token for fetching next page of results'),
     credentials: z
       .record(z.nativeEnum(CredentialType), z.string())
       .optional()
@@ -966,21 +970,24 @@ export class GoogleDriveBubble<
     if (!credential) {
       throw new Error('Google Drive credentials are required');
     }
-    try {
-      // Test the credentials by making a simple API call
-      const response = await fetch(
-        'https://www.googleapis.com/drive/v3/about?fields=user&supportsAllDrives=true',
-        {
-          headers: {
-            Authorization: `Bearer ${credential}`,
-            'Content-Type': 'application/json',
-          },
-        }
+
+    // Test the credentials by making a simple API call
+    const response = await fetch(
+      'https://www.googleapis.com/drive/v3/about?fields=user&supportsAllDrives=true',
+      {
+        headers: {
+          Authorization: `Bearer ${credential}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '');
+      throw new Error(
+        `Google Drive API error (${response.status}): ${errorText}`
       );
-      return response.ok;
-    } catch {
-      return false;
     }
+    return true;
   }
 
   private async makeGoogleApiRequest(
@@ -1357,7 +1364,14 @@ export class GoogleDriveBubble<
   private async listFiles(
     params: Extract<GoogleDriveParams, { operation: 'list_files' }>
   ): Promise<Extract<GoogleDriveResult, { operation: 'list_files' }>> {
-    const { folder_id, query, max_results, include_folders, order_by } = params;
+    const {
+      folder_id,
+      query,
+      max_results,
+      include_folders,
+      order_by,
+      page_token,
+    } = params;
 
     let searchQuery = '';
 
@@ -1391,6 +1405,10 @@ export class GoogleDriveBubble<
 
     if (searchQuery) {
       queryParams.set('q', searchQuery);
+    }
+
+    if (page_token) {
+      queryParams.set('pageToken', page_token);
     }
 
     const response = await this.makeGoogleApiRequest(
@@ -1955,7 +1973,7 @@ export class GoogleDriveBubble<
   }
 
   /**
-   * Extracts plain text from a content array
+   * Extracts plain text from a content array, handling paragraphs, tables, and table of contents
    */
   private extractPlainTextFromContent(
     content: Array<Record<string, unknown>>
@@ -1963,6 +1981,7 @@ export class GoogleDriveBubble<
     const textParts: string[] = [];
 
     for (const element of content) {
+      // Handle paragraphs
       const paragraph = element.paragraph as
         | { elements?: Array<Record<string, unknown>> }
         | undefined;
@@ -1973,6 +1992,53 @@ export class GoogleDriveBubble<
             textParts.push(textRun.content);
           }
         }
+        continue;
+      }
+
+      // Handle tables — format as markdown tables
+      const table = element.table as
+        | {
+            tableRows?: Array<{
+              tableCells?: Array<{
+                content?: Array<Record<string, unknown>>;
+              }>;
+            }>;
+          }
+        | undefined;
+      if (table?.tableRows) {
+        const rows: string[][] = [];
+        for (const row of table.tableRows) {
+          const cells: string[] = [];
+          for (const cell of row.tableCells ?? []) {
+            // Recursively extract text from cell content, collapse newlines to spaces
+            const cellText = cell.content
+              ? this.extractPlainTextFromContent(cell.content)
+                  .replace(/\n+/g, ' ')
+                  .trim()
+              : '';
+            cells.push(cellText);
+          }
+          rows.push(cells);
+        }
+        if (rows.length > 0) {
+          const lines: string[] = [];
+          // First row as header
+          lines.push('| ' + rows[0].join(' | ') + ' |');
+          lines.push('| ' + rows[0].map(() => '---').join(' | ') + ' |');
+          for (let i = 1; i < rows.length; i++) {
+            lines.push('| ' + rows[i].join(' | ') + ' |');
+          }
+          textParts.push(lines.join('\n') + '\n\n');
+        }
+        continue;
+      }
+
+      // Handle table of contents — has a content[] array like paragraphs
+      const toc = element.tableOfContents as
+        | { content?: Array<Record<string, unknown>> }
+        | undefined;
+      if (toc?.content) {
+        textParts.push(this.extractPlainTextFromContent(toc.content));
       }
     }
 

@@ -4,7 +4,7 @@
 
 # Bubble Lab
 
-### Open-source agentic workflow automation builder with full observability and exportability.
+### Open-core workflow engine powering Bubble Lab — and fully runnable, hostable, and extensible on its own.
 
 [![Discord](https://img.shields.io/discord/1411776181476266184?color=7289da&label=Discord&logo=discord&logoColor=ffffff)](https://discord.com/invite/PkJvcU2myV)
 [![Docs](https://img.shields.io/badge/Docs-📘%20Documentation-blue)](https://docs.bubblelab.ai/intro)
@@ -13,38 +13,103 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE.txt)
 [![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 
-[Try it](https://app.bubblelab.ai/) - [Demos](https://www.bubblelab.ai/demos)
+[Use Bubble Lab Platform](https://app.bubblelab.ai/) • [View Demos](https://www.bubblelab.ai/demos) • [Documentation](https://docs.bubblelab.ai/intro)
 
 ---
 
-### Editing Flows
+### Editing Workflows
 
 ![Editing Flow](./showcase/editing-flow.gif)
 
-### Running Flows
+### Running Workflows
 
 ![Running Flow](./showcase/running-flow.gif)
 
 </div>
 
+---
+
 ## 📋 Overview
 
-[**Bubble Lab**](https://www.bubblelab.ai/) is a Typescript-native workflow automation platform built for developers who need full control, transparency, and type safety. Unlike traditional workflow builders that lock you into proprietary JSON nodes, Bubble Lab compiles everything into clean, production-ready TypeScript that you can own, debug, and deploy anywhere.
+[**Bubble Lab**](https://www.bubblelab.ai/) is a Slack-native AI operator platform that helps teams automate operational work directly inside Slack using Pearl, its AI assistant.
 
-**Key Features:**
+Instead of switching between tools, teams can ask Pearl to execute workflows, access systems, and perform tasks across their stack.
 
-- **Prompt to Workflow**: Describe what you want in natural language, and Pearl (our AI Assistant) instantly generate and amend working typescript workflows using our composable bubble system (integrations, tools) with branching and transformations. You get the visual, speed, and full flexibility of code.
-- **Full Observability**: Built-in execution tracing with detailed logs, token usage and cost usage tracking for each supported services, and performance metrics. Debug with complete visibility into every step.
-- **Import from n8n/other workflow platform**: Migrate existing workflows seamlessly such as n8n. Any human-readable workflow can be converted bubble lab workflow with a good enough model.
-- **Export as TypeScript/API Instantly**: Own your workflows completely. Export clean, production-ready code that runs anywhere—integrate with your codebase, CI/CD pipelines.
+This repository contains the **open-core workflow engine that powers the Bubble Lab platform**.
+
+It is the same execution engine used internally by Bubble Lab — and can also be run, hosted, and extended independently.
+
+This makes it suitable for:
+
+- Teams using the Bubble Lab platform  
+- Developers who want full control over workflow execution  
+- Organizations that need self-hosted automation infrastructure  
+- Engineers building custom agents or integrations  
+
+---
+
+## 🧠 How this relates to Bubble Lab Platform
+
+You can use Bubble Lab in two ways:
+
+### Option 1 — Use Bubble Lab Platform (recommended)
+
+Use the fully managed platform with:
+
+- Pearl, the Slack-native AI operator interface  
+- Managed integrations with Slack, SaaS tools, APIs, and databases  
+- Hosted workflow execution and orchestration  
+- Observability dashboards and execution history  
+- Team collaboration and deployment management  
+
+👉 https://app.bubblelab.ai
+
+---
+
+### Option 2 — Run the Open-Core Engine Yourself
+
+You can run and host the workflow engine independently.
+
+This allows you to:
+
+- Build and execute workflows locally  
+- Host the engine in your own infrastructure  
+- Create custom agents and integrations  
+- Extend the runtime for your own use cases  
+- Export workflows and deploy anywhere  
+- Embed Bubble Lab workflows inside your own products  
+
+Everything in this repository is fully functional and production-ready.
+
+---
+
+## ⚙️ What this repository provides
+
+The open-core engine includes:
+
+- Workflow execution runtime  
+- Agent and integration primitives ("Bubbles")  
+- Local workflow studio  
+- Execution tracing, logging, and observability  
+- CLI tooling  
+- Exportable workflows  
+
+This is the infrastructure layer that powers Bubble Lab and Pearl.
+
+---
 
 ## 🚀 Quick Start
 
-### 1. Hosted Bubble Studio (Cloud Version)
+### Option A — Use Bubble Lab Platform
 
-No setup required, start building immediately with managed integrations 👉 [Try Now](https://app.bubblelab.ai)
+No setup required:
 
-### 2. Run Locally
+https://app.bubblelab.ai
+
+---
+
+### Option B — Run locally
+
 
 Run Bubble Studio locally in **2 commands**:
 
@@ -56,11 +121,11 @@ pnpm install
 pnpm run dev
 ```
 
-Open **http://localhost:3000** and start building workflows!
+Open **http://localhost:3000** and you can now build, edit, and run workflows locally!
 
-**⚠️ Note:** To create flow with pearl (our ai assistant), you'll need API keys (GOOGLE_API_KEY and OPENROUTER_API_KEY). By default gemini-3.0-pro is used for generation and morph-v3 is used for apply editing. Weaker model is not well tested and can lead to degraded/inconsistent performance. See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed setup instructions.
+**⚠️ Note:** To create flow with pearl (our ai assistant), you'll need API keys (GOOGLE_API_KEY). By default gemini-3.0-pro is used for generation and code edits use fast find-and-replace. Weaker model is not well tested and can lead to degraded/inconsistent performance. See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed setup instructions.
 
-### 3. Create BubbleLab App
+### Option C — Create a new Bubble Lab project
 
 Get started with BubbleLab in seconds using our CLI tool:
 
@@ -174,8 +239,9 @@ The documentation includes:
 ## 🤝 Community & Support
 
 > **⚠️ UPDATE (January 20, 2026)**: We are no longer accepting code contributions or pull requests at this time. However, we still welcome and encourage:
+>
 > - 🐛 **Bug reports** - Help us identify issues
-> - 💬 **Feature requests** - Share your ideas for improvements  
+> - 💬 **Feature requests** - Share your ideas for improvements
 > - 🗨️ **Community discussions** - Join conversations in Discord
 > - 📖 **Documentation feedback** - Suggest improvements to our docs
 >
@@ -186,7 +252,8 @@ The documentation includes:
 - [Join our Discord community](https://discord.gg/PkJvcU2myV) for discussions and support
 - [Open issues](https://github.com/bubblelabai/BubbleLab/issues) for bugs or feature requests
 - Check out **[CONTRIBUTING.md](./CONTRIBUTING.md)** for project setup and architecture details
-  
+
 ## License
 
-Apache 2.0
+This repository contains the open-core components of Bubble Lab and is licensed under Apache 2.0.
+The Bubble Lab platform, Pearl, and hosted infrastructure include additional proprietary components not included in this repository.

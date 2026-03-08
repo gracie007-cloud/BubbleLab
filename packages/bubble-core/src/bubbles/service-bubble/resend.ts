@@ -3,6 +3,7 @@ import { ServiceBubble } from '../../types/service-bubble-class.js';
 import type { BubbleContext } from '../../types/bubble.js';
 import { CredentialType } from '@bubblelab/shared-schemas';
 import { type CreateEmailOptions, Resend } from 'resend';
+import { markdownToHtml } from '../../utils/markdown-to-html.js';
 
 // Define email address schema
 const EmailAddressSchema = z.string().email('Invalid email address format');
@@ -51,8 +52,18 @@ const ResendParamsSchema = z.discriminatedUnion('operation', [
       .string()
       .min(1, 'Subject is required')
       .describe('Email subject line'),
-    text: z.string().optional().describe('Plain text email content'),
-    html: z.string().optional().describe('HTML email content'),
+    text: z
+      .string()
+      .optional()
+      .describe(
+        'Email content (supports markdown — automatically converted to HTML for rendering)'
+      ),
+    html: z
+      .string()
+      .optional()
+      .describe(
+        'HTML email content. If not provided and text is set, HTML is auto-generated from text.'
+      ),
     reply_to: z
       .union([EmailAddressSchema, z.array(EmailAddressSchema)])
       .optional()
@@ -303,21 +314,17 @@ export class ResendBubble<
   }
 
   public async testCredential(): Promise<boolean> {
-    try {
-      // Test the API key by making a simple API call
-      const apiKey = this.chooseCredential();
+    // Test the API key by making a simple API call
+    const apiKey = this.chooseCredential();
 
-      // Clear cache if credentials changed (resend client will be recreated)
-      if (this.resend) {
-        this.verifiedDomains = undefined;
-      }
-
-      this.resend = new Resend(apiKey);
-      await this.resend?.domains.list();
-      return true;
-    } catch {
-      return false;
+    // Clear cache if credentials changed (resend client will be recreated)
+    if (this.resend) {
+      this.verifiedDomains = undefined;
     }
+
+    this.resend = new Resend(apiKey);
+    await this.resend?.domains.list();
+    return true;
   }
 
   protected async performAction(
@@ -384,6 +391,9 @@ export class ResendBubble<
       throw new Error('Either text or html content must be provided');
     }
 
+    // Auto-convert markdown text to HTML when no HTML is provided
+    const resolvedHtml = html || (text ? markdownToHtml(text) : undefined);
+
     // Enforce domain validation - ensure the from domain is verified
     if (from) {
       try {
@@ -410,7 +420,7 @@ export class ResendBubble<
     if (cc) emailPayload.cc = cc;
     if (bcc) emailPayload.bcc = bcc;
     if (text) emailPayload.text = text;
-    if (html) emailPayload.html = html;
+    if (resolvedHtml) emailPayload.html = resolvedHtml;
     if (reply_to) emailPayload.replyTo = reply_to;
     if (scheduled_at) emailPayload.scheduledAt = scheduled_at;
     if (attachments) {

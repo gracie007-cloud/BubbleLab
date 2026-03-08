@@ -9,8 +9,32 @@ import {
   notionOAuthMetadataSchema,
   confluenceOAuthMetadataSchema,
   stripeOAuthMetadataSchema,
+  linearOAuthMetadataSchema,
   credentialPreferencesSchema,
+  browserSessionMetadataSchema,
 } from './database-definition-schema.js';
+
+/**
+ * Structured credential requirements separating required from optional credentials.
+ * Used by BubbleInjector.findCredentials() and propagated through validation/execution layers.
+ */
+export interface CredentialRequirements {
+  required: Record<string, CredentialType[]>;
+  optional: Record<string, CredentialType[]>;
+}
+
+/**
+ * A single field within a multi-field credential.
+ * When a credential type has `fields`, the UI renders multiple labeled inputs
+ * and stores them as a single JSON-encoded `value`.
+ */
+export interface CredentialField {
+  key: string;
+  label: string;
+  placeholder: string;
+  type?: 'text' | 'password'; // default 'password'
+  required?: boolean; // default true
+}
 
 /**
  * Configuration for a credential type displayed in the UI
@@ -21,6 +45,39 @@ export interface CredentialConfig {
   placeholder: string;
   namePlaceholder: string;
   credentialConfigurations: Record<string, unknown>;
+  fields?: CredentialField[]; // multi-field credentials (stored as JSON value)
+}
+
+/**
+ * Base64-encode a JSON credential payload for safe injection into generated code.
+ * Structured credentials (multi-field, OAuth+metadata, browser sessions) contain JSON
+ * with quotes that get corrupted by BubbleInjector.escapeString(). Base64 avoids this.
+ */
+export function encodeCredentialPayload(jsonPayload: string): string {
+  return Buffer.from(jsonPayload).toString('base64');
+}
+
+/**
+ * Decode a credential payload that may be base64-encoded or raw JSON.
+ * Handles both formats:
+ * - **base64** (normal execution): credential-helper base64-encodes before injection
+ * - **raw JSON/string** (validator path): credential-validator passes decrypted value directly
+ *
+ * Used by any bubble that receives structured credential data:
+ * multi-field credentials (SendSafely), OAuth+metadata (Jira/Confluence),
+ * browser sessions (BrowserBase/Amazon/LinkedIn).
+ */
+export function decodeCredentialPayload<T = Record<string, unknown>>(
+  value: string
+): T {
+  let json: string;
+  try {
+    json = Buffer.from(value, 'base64').toString('utf-8');
+    JSON.parse(json); // validate it's JSON after decoding
+  } catch {
+    json = value; // already raw JSON (validator path)
+  }
+  return JSON.parse(json) as T;
 }
 
 /**
@@ -282,6 +339,16 @@ export const CREDENTIAL_TYPE_CONFIG: Record<CredentialType, CredentialConfig> =
         'Browser session authentication for Amazon shopping (cart, orders, purchases). Authenticate by logging into your Amazon account in a secure browser session.',
       placeholder: '', // Not used for browser session auth
       namePlaceholder: 'My Amazon Account',
+      credentialConfigurations: {
+        proxy: { server: '', username: '', password: '' },
+      },
+    },
+    [CredentialType.BROWSERBASE_CRED]: {
+      label: 'BrowserBase',
+      description:
+        'Usage tracking for BrowserBase browser automation (billed per minute of browser session time). Used internally for billing; credentials are AMAZON_CRED/LINKEDIN_CRED.',
+      placeholder: '',
+      namePlaceholder: 'BrowserBase Usage',
       credentialConfigurations: {},
     },
     [CredentialType.LINKEDIN_CRED]: {
@@ -290,7 +357,9 @@ export const CREDENTIAL_TYPE_CONFIG: Record<CredentialType, CredentialConfig> =
         'Browser session authentication for LinkedIn automation (connections, messaging). Authenticate by logging into your LinkedIn account in a secure browser session.',
       placeholder: '', // Not used for browser session auth
       namePlaceholder: 'My LinkedIn Account',
-      credentialConfigurations: {},
+      credentialConfigurations: {
+        proxy: { server: '', username: '', password: '' },
+      },
     },
     [CredentialType.JIRA_CRED]: {
       label: 'Jira',
@@ -330,6 +399,134 @@ export const CREDENTIAL_TYPE_CONFIG: Record<CredentialType, CredentialConfig> =
         'OAuth connection to Confluence Cloud for wiki and content management',
       placeholder: '', // Not used for OAuth
       namePlaceholder: 'My Confluence Connection',
+      credentialConfigurations: {},
+    },
+    [CredentialType.POSTHOG_API_KEY]: {
+      label: 'PostHog',
+      description:
+        'Personal API Key for PostHog product analytics (events, persons, insights, HogQL queries)',
+      placeholder: 'phx_...',
+      namePlaceholder: 'My PostHog API Key',
+      credentialConfigurations: {},
+    },
+    [CredentialType.SORTLY_API_KEY]: {
+      label: 'Sortly',
+      description:
+        'API key for Sortly inventory management (Enterprise plan required)',
+      placeholder: 'Your Sortly API key',
+      namePlaceholder: 'My Sortly API Key',
+      credentialConfigurations: {},
+    },
+    [CredentialType.SENDSAFELY_CRED]: {
+      label: 'SendSafely',
+      description: 'SendSafely API credentials for encrypted file transfer',
+      placeholder: '',
+      namePlaceholder: 'My SendSafely Credentials',
+      credentialConfigurations: {},
+      fields: [
+        {
+          key: 'host',
+          label: 'Host URL',
+          placeholder: 'https://app.sendsafely.com',
+          type: 'text',
+        },
+        {
+          key: 'apiKey',
+          label: 'API Key',
+          placeholder: 'Your API key from Profile > API Keys',
+          type: 'password',
+        },
+        {
+          key: 'apiSecret',
+          label: 'API Secret',
+          placeholder: 'Your API secret from Profile > API Keys',
+          type: 'password',
+        },
+      ],
+    },
+    [CredentialType.S3_CRED]: {
+      label: 'Amazon S3',
+      description:
+        'S3-compatible storage credentials (AWS S3, MinIO, DigitalOcean Spaces, etc.)',
+      placeholder: '',
+      namePlaceholder: 'My S3 Storage',
+      credentialConfigurations: {},
+      fields: [
+        {
+          key: 'accessKeyId',
+          label: 'Access Key ID',
+          placeholder: 'AKIA...',
+          type: 'password',
+        },
+        {
+          key: 'secretAccessKey',
+          label: 'Secret Access Key',
+          placeholder: 'Your secret access key',
+          type: 'password',
+        },
+        {
+          key: 'endpoint',
+          label: 'Endpoint',
+          placeholder:
+            'https://s3.us-east-1.amazonaws.com (leave empty for AWS)',
+          type: 'text',
+          required: false,
+        },
+        {
+          key: 'region',
+          label: 'Region',
+          placeholder: 'us-east-1',
+          type: 'text',
+          required: false,
+        },
+      ],
+    },
+    [CredentialType.LINEAR_CRED]: {
+      label: 'Linear',
+      description:
+        'OAuth connection to Linear for issue tracking and project management',
+      placeholder: '', // Not used for OAuth
+      namePlaceholder: 'My Linear Connection',
+      credentialConfigurations: {},
+    },
+    [CredentialType.HUBSPOT_CRED]: {
+      label: 'HubSpot',
+      description:
+        'OAuth connection to HubSpot CRM for managing contacts, companies, deals, and tickets',
+      placeholder: '', // Not used for OAuth
+      namePlaceholder: 'My HubSpot Connection',
+      credentialConfigurations: {},
+    },
+    [CredentialType.ATTIO_CRED]: {
+      label: 'Attio',
+      description:
+        'OAuth connection to Attio CRM for managing records, notes, tasks, and lists',
+      placeholder: '', // Not used for OAuth
+      namePlaceholder: 'My Attio Connection',
+      credentialConfigurations: {},
+    },
+    [CredentialType.ASSEMBLED_CRED]: {
+      label: 'Assembled',
+      description:
+        'API key for Assembled workforce management (schedules, agents, time off)',
+      placeholder: 'sk_live_...',
+      namePlaceholder: 'My Assembled API Key',
+      credentialConfigurations: {},
+    },
+    [CredentialType.XERO_CRED]: {
+      label: 'Xero',
+      description:
+        'OAuth connection to Xero for accounting, invoicing, and financial management',
+      placeholder: '', // Not used for OAuth
+      namePlaceholder: 'My Xero Connection',
+      credentialConfigurations: {},
+    },
+    [CredentialType.RAMP_CRED]: {
+      label: 'Ramp',
+      description:
+        'OAuth connection to Ramp for corporate expense and spend management',
+      placeholder: '', // Not used for OAuth
+      namePlaceholder: 'My Ramp Connection',
       credentialConfigurations: {},
     },
     [CredentialType.CREDENTIAL_WILDCARD]: {
@@ -389,6 +586,7 @@ export const CREDENTIAL_ENV_MAP: Record<CredentialType, string> = {
   [CredentialType.INSFORGE_API_KEY]: 'INSFORGE_API_KEY',
   [CredentialType.CUSTOM_AUTH_KEY]: '', // User-provided, no env var
   [CredentialType.AMAZON_CRED]: '', // Browser session credential, no env var
+  [CredentialType.BROWSERBASE_CRED]: '', // Usage tracking only, no env var
   [CredentialType.LINKEDIN_CRED]: '', // Browser session credential, no env var
   [CredentialType.CRUSTDATA_API_KEY]: 'CRUSTDATA_API_KEY',
   [CredentialType.JIRA_CRED]: '', // OAuth credential, no env var
@@ -396,6 +594,16 @@ export const CREDENTIAL_ENV_MAP: Record<CredentialType, string> = {
   [CredentialType.FULLENRICH_API_KEY]: 'FULLENRICH_API_KEY',
   [CredentialType.STRIPE_CRED]: 'STRIPE_SECRET_KEY',
   [CredentialType.CONFLUENCE_CRED]: '', // OAuth credential, no env var
+  [CredentialType.POSTHOG_API_KEY]: 'POSTHOG_API_KEY',
+  [CredentialType.SENDSAFELY_CRED]: '', // Multi-field credential (host + apiKey + apiSecret), no single env var
+  [CredentialType.S3_CRED]: '', // Multi-field credential (accessKeyId + secretAccessKey + endpoint + region), no single env var
+  [CredentialType.LINEAR_CRED]: '', // OAuth credential, no env var
+  [CredentialType.HUBSPOT_CRED]: '', // OAuth credential, no env var
+  [CredentialType.ATTIO_CRED]: '', // OAuth credential, no env var
+  [CredentialType.SORTLY_API_KEY]: 'SORTLY_API_KEY',
+  [CredentialType.ASSEMBLED_CRED]: 'ASSEMBLED_API_KEY',
+  [CredentialType.XERO_CRED]: '', // OAuth credential, no env var
+  [CredentialType.RAMP_CRED]: '', // OAuth credential, no env var
   [CredentialType.CREDENTIAL_WILDCARD]: '', // Wildcard marker, not a real credential
 };
 
@@ -437,7 +645,12 @@ export type OAuthProvider =
   | 'notion'
   | 'jira'
   | 'slack'
-  | 'airtable';
+  | 'airtable'
+  | 'linear'
+  | 'attio'
+  | 'hubspot'
+  | 'xero'
+  | 'ramp';
 
 /**
  * Scope description mapping - maps OAuth scope URLs to human-readable descriptions
@@ -745,8 +958,12 @@ export const OAUTH_PROVIDERS: Record<OAuthProvider, OAuthProviderConfig> = {
           'groups:read',
           'im:read',
           'mpim:read',
-          // Channels & Conversations - Write (non-admin)
+          // Channels & Conversations - Write
           'channels:join',
+          'im:write',
+          'im:write.topic',
+          'mpim:write',
+          'mpim:write.topic',
           // Users & Team (read-only)
           'users:read',
           'users:read.email',
@@ -781,11 +998,6 @@ export const OAUTH_PROVIDERS: Record<OAuthProvider, OAuthProviderConfig> = {
           'groups:write',
           'groups:write.invites',
           'groups:write.topic',
-          // DM management (requires admin)
-          'im:write',
-          'im:write.topic',
-          'mpim:write',
-          'mpim:write.topic',
           // User management (requires admin)
           'users:write',
           'usergroups:write',
@@ -814,10 +1026,6 @@ export const OAUTH_PROVIDERS: Record<OAuthProvider, OAuthProviderConfig> = {
           'remote_files:share',
           // Assistant (requires admin)
           'assistant:write',
-          // Search (requires admin)
-          'search:read.files',
-          'search:read.public',
-          'search:read.users',
           // Team Preferences (requires admin)
           'team.preferences:read',
         ],
@@ -1140,22 +1348,6 @@ export const OAUTH_PROVIDERS: Record<OAuthProvider, OAuthProviderConfig> = {
             description: 'Respond in Slack AI threads',
             defaultEnabled: true,
           },
-          // Search
-          {
-            scope: 'search:read.files',
-            description: 'Search files',
-            defaultEnabled: true,
-          },
-          {
-            scope: 'search:read.public',
-            description: 'Search public channels',
-            defaultEnabled: true,
-          },
-          {
-            scope: 'search:read.users',
-            description: 'Search for users',
-            defaultEnabled: true,
-          },
           // Team Preferences
           {
             scope: 'team.preferences:read',
@@ -1226,6 +1418,363 @@ export const OAUTH_PROVIDERS: Record<OAuthProvider, OAuthProviderConfig> = {
             scope: 'webhook:manage',
             description:
               'View, create, delete webhooks for a base, as well as fetch webhook payloads',
+            defaultEnabled: true,
+          },
+        ],
+      },
+    },
+  },
+  linear: {
+    name: 'linear',
+    displayName: 'Linear',
+    credentialTypes: {
+      [CredentialType.LINEAR_CRED]: {
+        displayName: 'Linear',
+        defaultScopes: ['read', 'write', 'issues:create', 'comments:create'],
+        description: 'Access Linear for issue tracking and project management',
+        scopeDescriptions: [
+          {
+            scope: 'read',
+            description: 'Read access to your Linear workspace data',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'write',
+            description:
+              'Write access to create and update issues, comments, and projects',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'issues:create',
+            description: 'Create new issues',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'comments:create',
+            description: 'Create comments on issues',
+            defaultEnabled: true,
+          },
+        ],
+      },
+    },
+    authorizationParams: {
+      prompt: 'consent',
+    },
+  },
+  attio: {
+    name: 'attio',
+    displayName: 'Attio',
+    credentialTypes: {
+      [CredentialType.ATTIO_CRED]: {
+        displayName: 'Attio CRM',
+        defaultScopes: [
+          'record_permission:read',
+          'record_permission:read-write',
+          'object_configuration:read',
+          'note:read-write',
+          'task:read-write',
+          'list_entry:read',
+          'list_entry:read-write',
+          'list_configuration:read',
+          'user_management:read',
+        ],
+        description:
+          'Access Attio CRM for managing records, notes, tasks, and lists',
+        scopeDescriptions: [
+          {
+            scope: 'record_permission:read',
+            description: 'View records (people, companies, custom objects)',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'record_permission:read-write',
+            description: 'Create, update, and delete records',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'object_configuration:read',
+            description: 'View object and attribute configurations',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'note:read-write',
+            description: 'Create, view, and manage notes on records',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'task:read-write',
+            description: 'Create, view, update, and delete tasks',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'list_entry:read',
+            description: 'View list entries and pipeline data',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'list_entry:read-write',
+            description: 'Add and modify list entries',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'list_configuration:read',
+            description: 'View list configurations',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'user_management:read',
+            description: 'View workspace member information',
+            defaultEnabled: true,
+          },
+        ],
+      },
+    },
+    authorizationParams: {
+      prompt: 'consent',
+    },
+  },
+  hubspot: {
+    name: 'hubspot',
+    displayName: 'HubSpot',
+    credentialTypes: {
+      [CredentialType.HUBSPOT_CRED]: {
+        displayName: 'HubSpot CRM',
+        defaultScopes: [
+          'crm.objects.contacts.read',
+          'crm.objects.contacts.write',
+          'crm.objects.companies.read',
+          'crm.objects.companies.write',
+          'crm.objects.deals.read',
+          'crm.objects.deals.write',
+          'crm.objects.custom.read',
+          'crm.objects.custom.write',
+          'tickets',
+        ],
+        description:
+          'Access HubSpot CRM for managing contacts, companies, deals, and tickets',
+        scopeDescriptions: [
+          {
+            scope: 'crm.objects.contacts.read',
+            description: 'View contacts and their properties',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'crm.objects.contacts.write',
+            description: 'Create, update, and delete contacts',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'crm.objects.companies.read',
+            description: 'View companies and their properties',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'crm.objects.companies.write',
+            description: 'Create, update, and delete companies',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'crm.objects.deals.read',
+            description: 'View deals and their properties',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'crm.objects.deals.write',
+            description: 'Create, update, and delete deals',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'crm.objects.custom.read',
+            description: 'View custom objects including tickets',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'crm.objects.custom.write',
+            description: 'Create, update, and delete custom objects',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'tickets',
+            description: 'Manage support tickets',
+            defaultEnabled: true,
+          },
+        ],
+      },
+    },
+    authorizationParams: {
+      prompt: 'consent',
+    },
+  },
+  ramp: {
+    name: 'ramp',
+    displayName: 'Ramp',
+    credentialTypes: {
+      [CredentialType.RAMP_CRED]: {
+        displayName: 'Ramp',
+        defaultScopes: [
+          'transactions:read',
+          'users:read',
+          'cards:read',
+          'departments:read',
+          'locations:read',
+          'spend_programs:read',
+          'limits:read',
+          'reimbursements:read',
+          'bills:read',
+          'receipts:read',
+          'vendors:read',
+          'business:read',
+          'statements:read',
+        ],
+        description: 'Access Ramp for corporate expense and spend management',
+        scopeDescriptions: [
+          {
+            scope: 'transactions:read',
+            description: 'View spending activity across cards and funds',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'users:read',
+            description: 'View employees and their information',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'cards:read',
+            description: 'View corporate cards',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'departments:read',
+            description: 'View departments',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'locations:read',
+            description: 'View locations',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'spend_programs:read',
+            description: 'View spend programs',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'limits:read',
+            description: 'View spend limits and funds',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'reimbursements:read',
+            description: 'View reimbursements',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'bills:read',
+            description: 'View bills',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'receipts:read',
+            description: 'View receipts',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'vendors:read',
+            description: 'View vendors',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'business:read',
+            description: 'View business information',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'statements:read',
+            description: 'View statements',
+            defaultEnabled: true,
+          },
+        ],
+      },
+    },
+  },
+  xero: {
+    name: 'xero',
+    displayName: 'Xero',
+    credentialTypes: {
+      [CredentialType.XERO_CRED]: {
+        displayName: 'Xero',
+        defaultScopes: [
+          'openid',
+          'offline_access',
+          'accounting.invoices',
+          'accounting.contacts',
+          'accounting.settings',
+          'accounting.reports.balancesheet.read',
+          'accounting.reports.profitandloss.read',
+          'accounting.reports.trialbalance.read',
+          'accounting.reports.banksummary.read',
+          'accounting.reports.executivesummary.read',
+          'accounting.reports.budgetsummary.read',
+          'accounting.reports.aged.read',
+        ],
+        description:
+          'Access Xero for accounting, invoicing, and financial management',
+        scopeDescriptions: [
+          {
+            scope: 'accounting.invoices',
+            description:
+              'View and create invoices, bills, and other transactions',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.contacts',
+            description: 'View and manage customers and suppliers',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.settings',
+            description: 'View accounting settings and chart of accounts',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.reports.balancesheet.read',
+            description: 'View Balance Sheet reports',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.reports.profitandloss.read',
+            description: 'View Profit & Loss reports',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.reports.trialbalance.read',
+            description: 'View Trial Balance reports',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.reports.banksummary.read',
+            description: 'View Bank Summary (cash balances and movements)',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.reports.executivesummary.read',
+            description: 'View Executive Summary (business KPIs and ratios)',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.reports.budgetsummary.read',
+            description: 'View Budget Summary (budget vs actual)',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'accounting.reports.aged.read',
+            description: 'View Aged Receivables and Aged Payables reports',
+            defaultEnabled: true,
+          },
+          {
+            scope: 'offline_access',
+            description:
+              'Maintain access when you are not actively using the app',
             defaultEnabled: true,
           },
         ],
@@ -1410,6 +1959,17 @@ export type CredentialOptions = Partial<Record<CredentialType, string>>;
 export type BubbleCredentialOption = CredentialType[];
 
 /**
+ * Optional credentials shared by all BrowserBase tools (R2 for session storage).
+ * Add to any tool that uses BrowserBase to avoid repeating per-tool.
+ */
+export const BROWSERBASE_OPTIONAL_CREDENTIALS: CredentialType[] = [
+  CredentialType.CLOUDFLARE_R2_ACCESS_KEY,
+  CredentialType.CLOUDFLARE_R2_SECRET_KEY,
+  CredentialType.CLOUDFLARE_R2_ACCOUNT_ID,
+  CredentialType.GOOGLE_GEMINI_CRED,
+];
+
+/**
  * Collection of credential options for all bubbles
  */
 export const BUBBLE_CREDENTIAL_OPTIONS: Record<
@@ -1457,7 +2017,7 @@ export const BUBBLE_CREDENTIAL_OPTIONS: Record<
   'sql-query-tool': [CredentialType.DATABASE_CRED],
   'chart-js-tool': [],
   'bubbleflow-validation-tool': [],
-  'code-edit-tool': [CredentialType.OPENROUTER_CRED],
+  'code-edit-tool': [],
   'web-search-tool': [CredentialType.FIRECRAWL_API_KEY],
   'web-scrape-tool': [CredentialType.FIRECRAWL_API_KEY],
   'web-crawl-tool': [
@@ -1535,15 +2095,11 @@ export const BUBBLE_CREDENTIAL_OPTIONS: Record<
   ],
   browserbase: [
     CredentialType.AMAZON_CRED,
-    CredentialType.CLOUDFLARE_R2_ACCESS_KEY,
-    CredentialType.CLOUDFLARE_R2_SECRET_KEY,
-    CredentialType.CLOUDFLARE_R2_ACCOUNT_ID,
+    ...BROWSERBASE_OPTIONAL_CREDENTIALS,
   ],
   'amazon-shopping-tool': [
     CredentialType.AMAZON_CRED,
-    CredentialType.CLOUDFLARE_R2_ACCESS_KEY,
-    CredentialType.CLOUDFLARE_R2_SECRET_KEY,
-    CredentialType.CLOUDFLARE_R2_ACCOUNT_ID,
+    ...BROWSERBASE_OPTIONAL_CREDENTIALS,
   ],
   crustdata: [CredentialType.CRUSTDATA_API_KEY],
   'company-enrichment-tool': [CredentialType.CRUSTDATA_API_KEY],
@@ -1556,14 +2112,79 @@ export const BUBBLE_CREDENTIAL_OPTIONS: Record<
   fullenrich: [CredentialType.FULLENRICH_API_KEY],
   'linkedin-connection-tool': [
     CredentialType.LINKEDIN_CRED,
-    CredentialType.CLOUDFLARE_R2_ACCESS_KEY,
-    CredentialType.CLOUDFLARE_R2_SECRET_KEY,
-    CredentialType.CLOUDFLARE_R2_ACCOUNT_ID,
+    ...BROWSERBASE_OPTIONAL_CREDENTIALS,
+  ],
+  'linkedin-sent-invitations-tool': [
+    CredentialType.LINKEDIN_CRED,
+    ...BROWSERBASE_OPTIONAL_CREDENTIALS,
+  ],
+  'linkedin-received-invitations-tool': [
+    CredentialType.LINKEDIN_CRED,
+    ...BROWSERBASE_OPTIONAL_CREDENTIALS,
+  ],
+  'linkedin-accept-invitations-tool': [
+    CredentialType.LINKEDIN_CRED,
+    ...BROWSERBASE_OPTIONAL_CREDENTIALS,
   ],
   stripe: [CredentialType.STRIPE_CRED],
   confluence: [CredentialType.CONFLUENCE_CRED],
+  sendsafely: [CredentialType.SENDSAFELY_CRED],
+  's3-storage': [CredentialType.S3_CRED],
   'yc-scraper-tool': [CredentialType.APIFY_CRED],
+  posthog: [CredentialType.POSTHOG_API_KEY],
+  linear: [CredentialType.LINEAR_CRED],
+  attio: [CredentialType.ATTIO_CRED],
+  hubspot: [CredentialType.HUBSPOT_CRED],
+  assembled: [CredentialType.ASSEMBLED_CRED],
+  xero: [CredentialType.XERO_CRED],
+  ramp: [CredentialType.RAMP_CRED],
 };
+
+export interface CredentialSiblingEntry {
+  oauthType: CredentialType;
+  apiType: CredentialType;
+  canonicalType: CredentialType;
+}
+
+/** Auto-derived sibling map: for OAuth-provider bubbles with exactly 2 cred types
+ *  (one OAuth + one API key), maps both types to their sibling pair. */
+export const CREDENTIAL_TYPE_SIBLINGS: Partial<
+  Record<CredentialType, CredentialSiblingEntry>
+> = (() => {
+  const oauthProviderNames = new Set(Object.keys(OAUTH_PROVIDERS));
+  const map: Partial<Record<CredentialType, CredentialSiblingEntry>> = {};
+  for (const [bubbleName, credTypes] of Object.entries(
+    BUBBLE_CREDENTIAL_OPTIONS
+  )) {
+    if (!oauthProviderNames.has(bubbleName) || credTypes.length !== 2) continue;
+    const oauthType = credTypes.find((ct) => isOAuthCredential(ct));
+    const apiType = credTypes.find((ct) => !isOAuthCredential(ct));
+    if (!oauthType || !apiType) continue;
+    const entry: CredentialSiblingEntry = {
+      oauthType,
+      apiType,
+      canonicalType: oauthType,
+    };
+    map[oauthType] = entry;
+    map[apiType] = entry;
+  }
+  return map;
+})();
+
+/** Get all sibling types for a credential (both OAuth and API), or just itself if no siblings. */
+export function getSiblingCredentialTypes(
+  credType: CredentialType
+): CredentialType[] {
+  const sibling = CREDENTIAL_TYPE_SIBLINGS[credType];
+  return sibling ? [sibling.oauthType, sibling.apiType] : [credType];
+}
+
+/** Collapse sibling types to canonical (OAuth) type. */
+export function getCanonicalCredentialType(
+  credType: CredentialType
+): CredentialType {
+  return CREDENTIAL_TYPE_SIBLINGS[credType]?.canonicalType || credType;
+}
 
 // POST /credentials - Create credential schema
 export const createCredentialSchema = z
@@ -1674,12 +2295,14 @@ export const credentialResponseSchema = z
         notionOAuthMetadataSchema,
         confluenceOAuthMetadataSchema,
         stripeOAuthMetadataSchema,
+        linearOAuthMetadataSchema,
+        browserSessionMetadataSchema,
         credentialPreferencesSchema,
       ])
       .optional()
       .openapi({
         description:
-          'Credential metadata (DatabaseMetadata, JiraOAuthMetadata, SlackOAuthMetadata, AirtableOAuthMetadata, GoogleOAuthMetadata, NotionOAuthMetadata, ConfluenceOAuthMetadata, StripeOAuthMetadata, or CredentialPreferences)',
+          'Credential metadata (DatabaseMetadata, JiraOAuthMetadata, SlackOAuthMetadata, AirtableOAuthMetadata, GoogleOAuthMetadata, NotionOAuthMetadata, ConfluenceOAuthMetadata, StripeOAuthMetadata, LinearOAuthMetadata, or CredentialPreferences)',
       }),
     createdAt: z.string().openapi({ description: 'Creation timestamp' }),
 
@@ -1761,6 +2384,23 @@ export const browserbaseSessionCreateRequestSchema = z
       description: 'User-friendly name for the credential',
       example: 'My Amazon Account',
     }),
+    proxy: z
+      .object({
+        server: z.string().describe('Proxy server URL'),
+        username: z
+          .string()
+          .optional()
+          .describe('Proxy authentication username'),
+        password: z
+          .string()
+          .optional()
+          .describe('Proxy authentication password'),
+      })
+      .optional()
+      .openapi({
+        description:
+          'Optional proxy to attach to the session (login browser will use it)',
+      }),
   })
   .openapi('BrowserbaseSessionCreateRequest');
 
@@ -1792,6 +2432,23 @@ export const browserbaseSessionCompleteRequestSchema = z
     name: z.string().optional().openapi({
       description: 'User-friendly name for the credential',
     }),
+    proxy: z
+      .object({
+        server: z.string().describe('Proxy server URL'),
+        username: z
+          .string()
+          .optional()
+          .describe('Proxy authentication username'),
+        password: z
+          .string()
+          .optional()
+          .describe('Proxy authentication password'),
+      })
+      .optional()
+      .openapi({
+        description:
+          'Optional proxy configuration to embed in the session credential',
+      }),
   })
   .openapi('BrowserbaseSessionCompleteRequest');
 

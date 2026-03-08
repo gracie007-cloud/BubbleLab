@@ -5,9 +5,14 @@ import {
 } from '../../types/tool-bubble-class.js';
 import type { BubbleContext } from '../../types/bubble.js';
 import { CredentialType } from '@bubblelab/shared-schemas';
-import { ChartJSNodeCanvas } from 'chartjs-node-canvas';
+import { createCanvas } from '@napi-rs/canvas';
+import { Chart, registerables } from 'chart.js';
+import type { ChartConfiguration } from 'chart.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+
+// Register all Chart.js components once at module level
+Chart.register(...registerables);
 
 // Define supported chart types
 const ChartType = z.enum([
@@ -826,16 +831,129 @@ export class ChartJSTool extends ToolBubble<
   ): Promise<Buffer> {
     const { width, height } = dimensions;
 
-    const chartJSNodeCanvas = new ChartJSNodeCanvas({
-      width,
-      height,
-      backgroundColour: 'white',
-    });
-
     console.log(
       `🎨 [ChartJSTool] Rendering chart to buffer (${width}x${height})...`
     );
-    return chartJSNodeCanvas.renderToBuffer(chartConfig as any);
+
+    const dpr = 1;
+    const canvas = createCanvas(width * dpr, height * dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    // Scale up default font sizes so text is readable at the larger pixel size
+    const existingOptions = (chartConfig.options ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const existingPlugins = (existingOptions.plugins ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const existingTitle = (existingPlugins.title ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const existingTitleFont = (existingTitle.font ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const existingLegend = (existingPlugins.legend ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const existingLegendLabels = (existingLegend.labels ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const existingScales = (existingOptions.scales ?? {}) as Record<
+      string,
+      Record<string, unknown>
+    >;
+
+    // Apply default dark text/grid colors to all scales (axis labels, ticks, gridlines)
+    // Only set defaults — don't override colors the caller explicitly configured.
+    const patchedScales: Record<string, unknown> = {};
+    for (const [axisKey, axisCfg] of Object.entries(existingScales)) {
+      const cfg = (axisCfg ?? {}) as Record<string, unknown>;
+      const ticks = (cfg.ticks ?? {}) as Record<string, unknown>;
+      const grid = (cfg.grid ?? {}) as Record<string, unknown>;
+      const title = (cfg.title ?? {}) as Record<string, unknown>;
+      const titleFont = (title.font ?? {}) as Record<string, unknown>;
+      patchedScales[axisKey] = {
+        ...cfg,
+        ticks: { color: '#374151', ...ticks },
+        grid: { color: 'rgba(0, 0, 0, 0.08)', ...grid },
+        title: {
+          ...title,
+          color: title.color ?? '#374151',
+          font: { size: 14, ...titleFont },
+        },
+      };
+    }
+
+    const chart = new Chart(canvas as unknown as HTMLCanvasElement, {
+      ...(chartConfig as unknown as ChartConfiguration),
+      options: {
+        ...existingOptions,
+        responsive: false,
+        animation: false,
+        color: existingOptions.color ?? '#374151',
+        font: {
+          size: 14,
+          ...((existingOptions.font as Record<string, unknown>) ?? {}),
+        },
+        scales: patchedScales as ChartConfiguration['options'] extends {
+          scales?: infer S;
+        }
+          ? S
+          : never,
+        plugins: {
+          ...existingPlugins,
+          title: {
+            ...existingTitle,
+            color: existingTitle.color ?? '#111827',
+            font: {
+              size: 18,
+              weight: 'bold' as const,
+              ...existingTitleFont,
+            },
+          },
+          legend: {
+            ...existingLegend,
+            labels: {
+              color: '#374151',
+              ...existingLegendLabels,
+              font: {
+                size: 13,
+                ...((existingLegendLabels.font as Record<string, unknown>) ??
+                  {}),
+              },
+            },
+          },
+        },
+      },
+      // Chart.js plugin to paint a white background. Chart.draw() calls clearRect()
+      // which wipes any pre-fill, leaving transparent pixels that become black in JPEG.
+      // This plugin runs after the clear but before chart elements are drawn.
+      plugins: [
+        {
+          id: 'white-background',
+          beforeDraw: (chartInstance: Chart) => {
+            const { ctx: c, width: w, height: h } = chartInstance;
+            c.save();
+            c.fillStyle = '#ffffff';
+            c.fillRect(0, 0, w, h);
+            c.restore();
+          },
+        },
+      ],
+    });
+    chart.draw();
+
+    const jpegBuffer = await canvas.encode('jpeg', 95);
+    chart.destroy();
+
+    return Buffer.from(jpegBuffer);
   }
 
   /**

@@ -166,6 +166,41 @@ export const notionOAuthMetadataSchema = z.object({
 export type NotionOAuthMetadata = z.infer<typeof notionOAuthMetadataSchema>;
 
 /**
+ * Linear OAuth metadata - stored after OAuth callback with organization info
+ */
+export const linearOAuthMetadataSchema = z.object({
+  organizationName: z.string().optional(),
+  /** Human-readable display name for the credential */
+  displayName: z.string().optional(),
+});
+
+export type LinearOAuthMetadata = z.infer<typeof linearOAuthMetadataSchema>;
+
+/**
+ * Xero OAuth metadata - stored after OAuth callback with tenantId for API calls
+ */
+export const xeroOAuthMetadataSchema = z.object({
+  tenantId: z.string(),
+  tenantName: z.string().optional(),
+  tenantType: z.string().optional(),
+  /** Human-readable display name for the credential */
+  displayName: z.string().optional(),
+});
+
+export type XeroOAuthMetadata = z.infer<typeof xeroOAuthMetadataSchema>;
+
+/**
+ * Ramp OAuth metadata - stored after OAuth callback with business info
+ */
+export const rampOAuthMetadataSchema = z.object({
+  businessName: z.string().optional(),
+  /** Human-readable display name for the credential */
+  displayName: z.string().optional(),
+});
+
+export type RampOAuthMetadata = z.infer<typeof rampOAuthMetadataSchema>;
+
+/**
  * Base preference fields that can be added to any credential metadata.
  * These are used for default credential selection and usage tracking.
  */
@@ -195,6 +230,31 @@ export type ConfluenceOAuthMetadata = z.infer<
 >;
 
 /**
+ * Proxy configuration for browser session credentials (embedded in session payload)
+ */
+export const browserSessionProxyConfigSchema = z.object({
+  server: z.string().describe('Proxy server URL'),
+  username: z.string().optional().describe('Proxy authentication username'),
+  password: z.string().optional().describe('Proxy authentication password'),
+});
+
+export type BrowserSessionProxyConfig = z.infer<
+  typeof browserSessionProxyConfigSchema
+>;
+
+/**
+ * Metadata for browser session credentials (AMAZON_CRED, LINKEDIN_CRED)
+ * Stored when completing BrowserBase session; proxy is embedded in the session payload
+ */
+export const browserSessionMetadataSchema = z.object({
+  proxy: browserSessionProxyConfigSchema.optional(),
+});
+
+export type BrowserSessionMetadata = z.infer<
+  typeof browserSessionMetadataSchema
+>;
+
+/**
  * Union type for all credential metadata types
  * - DatabaseMetadata: For DATABASE_CRED (PostgreSQL, etc.)
  * - JiraOAuthMetadata: For JIRA_CRED OAuth credentials
@@ -214,4 +274,6 @@ export type CredentialMetadata =
   | NotionOAuthMetadata
   | ConfluenceOAuthMetadata
   | StripeOAuthMetadata
+  | LinearOAuthMetadata
+  | BrowserSessionMetadata
   | CredentialPreferences;
